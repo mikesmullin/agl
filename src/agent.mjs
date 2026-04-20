@@ -1,6 +1,7 @@
 import { debug } from './lib/debug.mjs';
 import * as xai from './providers/xai.mjs';
 import * as copilot from './providers/copilot.mjs';
+import * as ollama from './providers/ollama.mjs';
 
 export default class Agent {
   // tool registry
@@ -38,19 +39,20 @@ export default class Agent {
   static async factory({ model, system_prompt, output_tool, tool_choice }) {
     const inst = new Agent();
     {
-      const [_provider, _model] = model.split(':');
-      inst.provider = _provider;
-      inst.model = _model;
+      const idx = model.indexOf(':');
+      inst.provider = model.slice(0, idx);
+      inst.model = model.slice(idx + 1);
     }
-    inst.client = { xai, copilot }[inst.provider];
+    inst.client = { xai, copilot, ollama }[inst.provider];
     inst.system_prompt = system_prompt;
     inst.tool_choice = tool_choice;
     await inst.client.init();
 
     if (output_tool) {
       inst.last_output = null;
+      inst.output_tool_name = output_tool?.name || 'final_result';
       inst.Tool(
-        output_tool?.name || 'final_result',
+        inst.output_tool_name,
         output_tool?.description || '',
         output_tool?.parameters || { output: { type: output_tool?.type } },
         output_tool?.required || ['output'],
@@ -101,8 +103,16 @@ export default class Agent {
       );
 
       if (toolCallChoices.length === 0) {
-        if (this.tool_choice == 'required') {
-          throw new Error('Agent response missing required tool call.');
+        if (this.output_tool_name && !done) {
+          // model stopped without calling the output tool — nudge it
+          const assistantMsg = result.choices?.[0]?.message;
+          if (assistantMsg) messages.push(assistantMsg);
+          messages.push({
+            role: 'user',
+            content: `Please call the \`${this.output_tool_name}\` tool now to end the session.`,
+          });
+          debug('Agent nudging model to call output tool.', this.output_tool_name);
+          continue;
         }
         return result;
       }
@@ -128,10 +138,7 @@ export default class Agent {
           }
           debug('Agent tool response.', { name: call.function.name, args, content });
 
-          if (
-            (this.output_tool?.name && this.output_tool.name == call.function.name) ||
-            ('final_result' == call.function.name)
-          ) {
+          if (this.output_tool_name && this.output_tool_name == call.function.name) {
             done = true;
           }
 

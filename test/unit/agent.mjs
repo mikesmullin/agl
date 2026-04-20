@@ -1,7 +1,7 @@
 import { debug, log } from '../../src/lib/debug.mjs';
 import Agent from '../../src/agent.mjs';
 
-const test0 = async () => {
+{ // test 1
   const agent = await Agent.factory({
     model: 'xai:grok-4-1-fast-reasoning',
     system_prompt: 'You are a helpful assistant that can answer questions and help with tasks.',
@@ -9,9 +9,9 @@ const test0 = async () => {
 
   const result = await agent.run({ prompt: 'What is 2+2?' });
   log('result', result);
-};
+}
 
-const test1 = async () => {
+{ // test 2
   const agent = await Agent.factory({
     model: 'xai:grok-4-1-fast-reasoning',
     system_prompt:
@@ -32,10 +32,4 @@ const test1 = async () => {
 
   const result2 = await agent.run({ prompt: 'I bet five is the winner', magic_num });
   log('', { result2 });
-};
-
-(async () => {
-  // await test0();
-  await test1();
-  // process.exit(0);
-})();
+}
