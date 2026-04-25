@@ -59,6 +59,7 @@ These are supported.
 |----------|-------------|------|
 | xAI | `xai:<model>` | `XAI_API_KEY` env var |
 | Copilot | `copilot:<model>` | GitHub device-flow OAuth |
+| LM Studio | `lm-studio:<model>` | None (localhost) |
 
 Creating an `.env` file in the project root with your provider API key(s) is also supported.
 

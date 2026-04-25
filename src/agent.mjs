@@ -2,6 +2,7 @@ import { debug } from './lib/debug.mjs';
 import * as xai from './providers/xai.mjs';
 import * as copilot from './providers/copilot.mjs';
 import * as ollama from './providers/ollama.mjs';
+import * as lmstudio from './providers/lm-studio.mjs';
 
 export default class Agent {
   // tool registry
@@ -43,7 +44,7 @@ export default class Agent {
       inst.provider = model.slice(0, idx);
       inst.model = model.slice(idx + 1);
     }
-    inst.client = { xai, copilot, ollama }[inst.provider];
+    inst.client = { xai, copilot, ollama, 'lm-studio': lmstudio }[inst.provider];
     inst.system_prompt = system_prompt;
     inst.tool_choice = tool_choice;
     await inst.client.init();
