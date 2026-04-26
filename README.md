@@ -1,4 +1,4 @@
-# Another Generative Language (AnGeL)
+# Another Generative Language (AnGeL) 👼
 
 A minimalist [Pydantic AI](https://ai.pydantic.dev/) clone in Bun JavaScript.
 
@@ -59,6 +59,7 @@ These are supported.
 |----------|-------------|------|
 | xAI | `xai:<model>` | `XAI_API_KEY` env var |
 | Copilot | `copilot:<model>` | GitHub device-flow OAuth |
+| Ollama | `ollama:<model>` | None (localhost) |
 | LM Studio | `lm-studio:<model>` | None (localhost) |
 
 Creating an `.env` file in the project root with your provider API key(s) is also supported.
@@ -73,3 +74,7 @@ DEBUG=1 bun src/agents/home.mjs set lights red    # with debug logging
 
 bun test/unit/agent.mjs                           # run tests
 ```
+
+## Related
+
+- [agl-agents](https://github.com/mikesmullin/agl-agents) example agent implementations
