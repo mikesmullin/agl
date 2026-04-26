@@ -24,12 +24,18 @@ async function _request({ method, uri, body = {} }) {
   if (response.ok) {
     return response;
   }
+  const errorBody = await response.text();
   const errorDetails = {
     status: response.status,
     statusText: response.statusText,
-    body: await response.text(),
+    body: errorBody,
   };
   debug('lm-studio _request error.', errorDetails);
+  // Always emit provider error details so root-cause is visible without DEBUG.
+  console.error(`[lm-studio] ${response.status} ${response.statusText}`);
+  if (errorBody) {
+    console.error(`[lm-studio] response body: ${errorBody}`);
+  }
   throw new Error(`LM Studio request error: ${response.status} ${response.statusText}`);
 }
 

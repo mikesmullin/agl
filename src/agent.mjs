@@ -5,6 +5,10 @@ import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
 
 export default class Agent {
+  static default = {
+    model: null,
+  };
+
   // tool registry
   tools = {};
   // register a tool call
@@ -39,10 +43,17 @@ export default class Agent {
 
   static async factory({ model, system_prompt, output_tool, tool_choice }) {
     const inst = new Agent();
+    const resolvedModel = model || Agent.default.model;
+    if (!resolvedModel) {
+      throw new Error('Agent.factory requires model or Agent.default.model');
+    }
     {
-      const idx = model.indexOf(':');
-      inst.provider = model.slice(0, idx);
-      inst.model = model.slice(idx + 1);
+      const idx = resolvedModel.indexOf(':');
+      if (idx <= 0 || idx >= resolvedModel.length - 1) {
+        throw new Error(`Invalid model format: ${resolvedModel}. Expected "provider:model".`);
+      }
+      inst.provider = resolvedModel.slice(0, idx);
+      inst.model = resolvedModel.slice(idx + 1);
     }
     inst.client = { xai, copilot, ollama, 'lm-studio': lmstudio }[inst.provider];
     inst.system_prompt = system_prompt;
@@ -57,7 +68,9 @@ export default class Agent {
         output_tool?.description || '',
         output_tool?.parameters || { output: { type: output_tool?.type } },
         output_tool?.required || ['output'],
-        output_tool?.fn || ((ctx, { output }) => { inst.last_output = output; }));
+        output_tool?.fn || ((ctx, args) => {
+          inst.last_output = Object.prototype.hasOwnProperty.call(args, 'output') ? args.output : args;
+        }));
       if (!inst.tool_choice) {
         inst.tool_choice = 'required';
       }

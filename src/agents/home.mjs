@@ -4,7 +4,8 @@ import { debug, log } from '../lib/debug.mjs';
 import { forceInt, forceRx, clamp } from '../lib/validate.mjs';
 
 const agent = await Agent.factory({
-  model: 'ollama:gemma4:26b',
+  // model: 'ollama:gemma4:26b',
+  model: 'lm-studio:google/gemma-4-e4b',
   system_prompt:
     'You are a personal assistant agent.\n' +
     'You help me control my home using home automation tools.',
