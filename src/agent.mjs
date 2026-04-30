@@ -7,6 +7,7 @@ import * as lmstudio from './providers/lm-studio.mjs';
 export default class Agent {
   static default = {
     model: null,
+    context_window: null,
   };
 
   // tool registry
@@ -41,9 +42,10 @@ export default class Agent {
     return tools;
   }
 
-  static async factory({ model, system_prompt, output_tool, tool_choice }) {
+  static async factory({ model, system_prompt, output_tool, tool_choice, context_window } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
+    inst.context_window = context_window ?? Agent.default.context_window ?? null;
     if (!resolvedModel) {
       throw new Error('Agent.factory requires model or Agent.default.model');
     }
@@ -95,6 +97,20 @@ export default class Agent {
       const req = { model: this.model, messages };
       if (hasTools) req.tools = this._renderTools();
       if (this.tool_choice) req.tool_choice = this.tool_choice;
+
+      if (this.context_window) {
+        let chars = 0;
+        for (const m of messages) {
+          chars += String(m.content || '').length;
+          if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+        }
+        const estimatedTokens = Math.ceil(chars / 4);
+        if (estimatedTokens > this.context_window) {
+          throw new Error(
+            `Prompt too large: ~${estimatedTokens.toLocaleString()} estimated tokens exceeds context_window of ${this.context_window.toLocaleString()}`,
+          );
+        }
+      }
 
       const result = await this.client.inference(req);
       debug('Agent.run result.', result);
