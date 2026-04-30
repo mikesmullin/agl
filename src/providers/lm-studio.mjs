@@ -46,15 +46,11 @@ export async function models() {
 }
 
 // request a completion (openai-compatible)
-export async function inference({ model = _defaultModel, messages, tools, tool_choice, max_tokens }) {
-  const body = { model, messages };
-  if (tools !== undefined) body.tools = tools;
-  if (tool_choice !== undefined) body.tool_choice = tool_choice;
-  if (max_tokens !== undefined) body.max_tokens = max_tokens;
+export async function inference({ model = _defaultModel, messages, tools, tool_choice }) {
   const response = await _request({
     method: 'POST',
     uri: '/v1/chat/completions',
-    body,
+    body: { model, messages, tools, tool_choice },
   });
   return await response.json();
 }
