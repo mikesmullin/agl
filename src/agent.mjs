@@ -79,16 +79,23 @@ export default class Agent {
     return inst;
   }
 
-  async run({ prompt, ...ctx }) {
-    const messages = [
-      { role: 'system', content: this.system_prompt },
-      { role: 'user', content: prompt },
-    ];
+  async run({ prompt, messages: preloadedMessages, ...ctx }) {
+    let messages;
+    if (preloadedMessages) {
+      messages = [...preloadedMessages];
+      if (prompt) messages.push({ role: 'user', content: prompt });
+    } else {
+      messages = [
+        { role: 'system', content: this.system_prompt },
+        { role: 'user', content: prompt },
+      ];
+    }
     const hasTools = Object.keys(this.tools).length > 0;
 
     let done = false;
     while (true) {
       if (done) {
+        this.ctx = [...messages];
         return this.last_output;
       }
 
@@ -128,6 +135,7 @@ export default class Agent {
           debug('Agent nudging model to call output tool.', this.output_tool_name);
           continue;
         }
+        this.ctx = [...messages];
         return result;
       }
 
