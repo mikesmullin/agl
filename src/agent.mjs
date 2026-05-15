@@ -7,6 +7,7 @@ import * as lmstudio from './providers/lm-studio.mjs';
 export default class Agent {
   static default = {
     model: null,
+    context_window: null,
   };
 
   // tool registry
@@ -41,9 +42,10 @@ export default class Agent {
     return tools;
   }
 
-  static async factory({ model, system_prompt, output_tool, tool_choice }) {
+  static async factory({ model, system_prompt, output_tool, tool_choice, context_window } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
+    inst.context_window = context_window ?? Agent.default.context_window ?? null;
     if (!resolvedModel) {
       throw new Error('Agent.factory requires model or Agent.default.model');
     }
@@ -79,29 +81,36 @@ export default class Agent {
     return inst;
   }
 
-  async run({ prompt, messages: preloadedMessages, ...ctx }) {
-    let messages;
-    if (preloadedMessages) {
-      messages = [...preloadedMessages];
-      if (prompt) messages.push({ role: 'user', content: prompt });
-    } else {
-      messages = [
-        { role: 'system', content: this.system_prompt },
-        { role: 'user', content: prompt },
-      ];
-    }
+  async run({ prompt, ...ctx }) {
+    const messages = [
+      { role: 'system', content: this.system_prompt },
+      { role: 'user', content: prompt },
+    ];
     const hasTools = Object.keys(this.tools).length > 0;
 
     let done = false;
     while (true) {
       if (done) {
-        this.ctx = [...messages];
         return this.last_output;
       }
 
       const req = { model: this.model, messages };
       if (hasTools) req.tools = this._renderTools();
       if (this.tool_choice) req.tool_choice = this.tool_choice;
+
+      if (this.context_window) {
+        let chars = 0;
+        for (const m of messages) {
+          chars += String(m.content || '').length;
+          if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+        }
+        const estimatedTokens = Math.ceil(chars / 4);
+        if (estimatedTokens > this.context_window) {
+          throw new Error(
+            `Prompt too large: ~${estimatedTokens.toLocaleString()} estimated tokens exceeds context_window of ${this.context_window.toLocaleString()}`,
+          );
+        }
+      }
 
       const result = await this.client.inference(req);
       debug('Agent.run result.', result);
@@ -130,12 +139,11 @@ export default class Agent {
           if (assistantMsg) messages.push(assistantMsg);
           messages.push({
             role: 'user',
-            content: `Please call the \`${this.output_tool_name}\` tool now to end the session.`,
+            content: `(To encourage structured output), we expect your final response to be given via tool call; Please use \`${this.output_tool_name}\` tool.`,
           });
           debug('Agent nudging model to call output tool.', this.output_tool_name);
           continue;
         }
-        this.ctx = [...messages];
         return result;
       }
 
@@ -154,8 +162,7 @@ export default class Agent {
           let content;
           if (fn) {
             const result = await fn(ctx, args);
-            const raw = typeof result === 'string' ? result : JSON.stringify(result);
-            content = raw ?? '';  // JSON.stringify(undefined) === undefined; providers require a string
+            content = typeof result === 'string' ? result : JSON.stringify(result);
           } else {
             content = JSON.stringify({ error: `unknown tool: ${call.function.name}` });
           }

@@ -198,14 +198,75 @@ export async function models() {
 }
 
 export async function inference({ model = _defaultModel, messages, tools, tool_choice }) {
-  // openai-compatible
+  // Normalize messages: convert any Anthropic-native tool_result user messages
+  // back to OpenAI tool messages (handles round-trips with claude-* models that
+  // return Anthropic-native format through the Copilot enterprise endpoint)
+  const normalizedMessages = messages.map(msg => {
+    // Convert Anthropic assistant messages that have tool_use in content array
+    // to OpenAI-compat format (tool_calls)
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      const toolUseBlocks = msg.content.filter(b => b.type === 'tool_use');
+      const textBlocks    = msg.content.filter(b => b.type === 'text');
+      if (toolUseBlocks.length > 0) {
+        return {
+          role: 'assistant',
+          content: textBlocks.map(b => b.text).join('') || null,
+          tool_calls: toolUseBlocks.map(b => ({
+            id: b.id,
+            type: 'function',
+            function: { name: b.name, arguments: JSON.stringify(b.input) },
+          })),
+        };
+      }
+    }
+    return msg;
+  });
+
   const res = await _request({
     method: 'POST', uri: '/chat/completions', body: {
       model,
-      messages,
+      messages: normalizedMessages,
       tools,
       // tool_choice,
     },
   });
-  return await res.json();
+  const result = await res.json();
+
+  // Normalize Anthropic-native response to OpenAI-compat format so agl-ai's
+  // agent loop can handle tool_calls correctly regardless of model provider.
+  // Anthropic returns: { stop_reason: 'tool_use', content: [{ type:'tool_use', ... }] }
+  // OpenAI returns:    { choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [...] } }] }
+  if (result.choices) {
+    for (const choice of result.choices) {
+      const msg = choice.message;
+      if (msg && Array.isArray(msg.content)) {
+        const toolUseBlocks = msg.content.filter(b => b.type === 'tool_use');
+        if (toolUseBlocks.length > 0) {
+          // Rewrite to OpenAI-compat shape in place
+          const textBlocks = msg.content.filter(b => b.type === 'text');
+          msg._anthropic_content = msg.content; // preserve for debugging
+          msg.content = textBlocks.map(b => b.text).join('') || null;
+          msg.tool_calls = toolUseBlocks.map(b => ({
+            id: b.id,
+            type: 'function',
+            function: { name: b.name, arguments: JSON.stringify(b.input) },
+          }));
+          choice.finish_reason = 'tool_calls';
+        }
+      }
+      // Normalize Anthropic stop_reason → finish_reason
+      if (!choice.finish_reason && choice.stop_reason) {
+        choice.finish_reason = choice.stop_reason === 'tool_use' ? 'tool_calls'
+          : choice.stop_reason === 'end_turn' ? 'stop'
+          : choice.stop_reason;
+      }
+      // Final: if message has tool_calls set, finish_reason MUST be 'tool_calls'
+      // (some gateway versions return finish_reason:'stop' even with tool_calls present)
+      if (msg && msg.tool_calls && msg.tool_calls.length > 0) {
+        choice.finish_reason = 'tool_calls';
+      }
+    }
+  }
+
+  return result;
 }
