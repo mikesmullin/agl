@@ -8,6 +8,8 @@ export default class Agent {
   static default = {
     model: null,
     context_window: null,
+    MAX_CTX_LEN: null,
+    WIDE_MODEL: null,
   };
 
   // tool registry
@@ -62,6 +64,17 @@ export default class Agent {
     inst.tool_choice = tool_choice;
     await inst.client.init();
 
+    const wideModelSpec = Agent.default.WIDE_MODEL;
+    if (wideModelSpec) {
+      const widx = wideModelSpec.indexOf(':');
+      const wideProvider = widx > 0 && widx < wideModelSpec.length - 1 ? wideModelSpec.slice(0, widx) : null;
+      inst._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
+      inst._wideClient = wideProvider ? { xai, copilot, ollama, 'lm-studio': lmstudio }[wideProvider] : inst.client;
+      if (inst._wideClient && inst._wideClient !== inst.client) {
+        await inst._wideClient.init();
+      }
+    }
+
     if (output_tool) {
       inst.last_output = null;
       inst.output_tool_name = output_tool?.name || 'final_result';
@@ -94,7 +107,21 @@ export default class Agent {
         return this.last_output;
       }
 
-      const req = { model: this.model, messages };
+      let activeModel = this.model;
+      let activeClient = this.client;
+      if (Agent.default.MAX_CTX_LEN && this._wideModel) {
+        let chars = 0;
+        for (const m of messages) {
+          chars += String(m.content || '').length;
+          if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+        }
+        if (chars > Agent.default.MAX_CTX_LEN) {
+          activeModel = this._wideModel;
+          activeClient = this._wideClient;
+        }
+      }
+
+      const req = { model: activeModel, messages };
       if (hasTools) req.tools = this._renderTools();
       if (this.tool_choice) req.tool_choice = this.tool_choice;
 
@@ -112,7 +139,7 @@ export default class Agent {
         }
       }
 
-      const result = await this.client.inference(req);
+      const result = await activeClient.inference(req);
       debug('Agent.run result.', result);
 
       // common response shape:
