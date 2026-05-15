@@ -7,7 +7,7 @@ let _baseUrl = '';
 
 // initialize provider
 export async function init() {
-  _baseUrl = await config.read('LM_STUDIO_BASE_URL') || 'http://localhost:1234';
+  _baseUrl = await config.read('LM_STUDIO_BASE_URL') || 'http://127.0.0.1:1234';
 }
 
 // make an api request
