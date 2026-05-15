@@ -154,7 +154,8 @@ export default class Agent {
           let content;
           if (fn) {
             const result = await fn(ctx, args);
-            content = typeof result === 'string' ? result : JSON.stringify(result);
+            const raw = typeof result === 'string' ? result : JSON.stringify(result);
+            content = raw ?? '';  // JSON.stringify(undefined) === undefined; providers require a string
           } else {
             content = JSON.stringify({ error: `unknown tool: ${call.function.name}` });
           }
