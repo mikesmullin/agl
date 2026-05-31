@@ -44,10 +44,11 @@ export default class Agent {
     return tools;
   }
 
-  static async factory({ model, system_prompt, output_tool, tool_choice, context_window } = {}) {
+  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
     inst.context_window = context_window ?? Agent.default.context_window ?? null;
+    inst.parallel_tools = parallel_tools ?? false;
     if (!resolvedModel) {
       throw new Error('Agent.factory requires model or Agent.default.model');
     }
@@ -180,8 +181,30 @@ export default class Agent {
       }
 
       // execute each tool call from all choices and append results
-      for (const choice of toolCallChoices) {
-        for (const call of choice.message.tool_calls) {
+      const allCalls = toolCallChoices.flatMap(choice => choice.message.tool_calls);
+      if (this.parallel_tools) {
+        const pending = allCalls.map(call => {
+          const fn = this.tools[call.function.name];
+          const args = JSON.parse(call.function.arguments);
+          debug('Agent tool call.', { name: call.function.name, args });
+          if (fn) {
+            return Promise.resolve(fn(ctx, args)).then(result => ({
+              call, args,
+              content: typeof result === 'string' ? result : JSON.stringify(result),
+            }));
+          }
+          return Promise.resolve({ call, args, content: JSON.stringify({ error: `unknown tool: ${call.function.name}` }) });
+        });
+        const settled = await Promise.all(pending);
+        for (const { call, args, content } of settled) {
+          debug('Agent tool response.', { name: call.function.name, args, content });
+          if (this.output_tool_name && this.output_tool_name == call.function.name) {
+            done = true;
+          }
+          messages.push({ role: 'tool', tool_call_id: call.id, content });
+        }
+      } else {
+        for (const call of allCalls) {
           const fn = this.tools[call.function.name];
           const args = JSON.parse(call.function.arguments);
           debug('Agent tool call.', { name: call.function.name, args });

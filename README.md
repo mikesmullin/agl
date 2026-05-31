@@ -35,6 +35,7 @@ const agent = await Agent.factory({
   model: 'xai:grok-4-1-fast-reasoning',
   system_prompt: 'Use the roulette_wheel function to check if the customer won.',
   output_tool: { type: 'boolean' },
+  parallel_tools: true, // execute multiple tool calls concurrently (default: false)
 });
 
 agent.Tool('roulette_wheel', 'check if the square is a winner', {
