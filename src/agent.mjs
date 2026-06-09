@@ -62,6 +62,46 @@ async function _withRetry(fn, opts = {}) {
   throw lastErr;
 }
 
+// ---------------------------------------------------------------------------
+// Global concurrency gate for Agent.run().
+// Every call to run() must acquire a slot before issuing provider inference and
+// release it when finished (success OR error). The number of slots is read live
+// from Agent.default.concurrency on each acquire, so callers can tune it at
+// runtime (e.g. Agent.default.concurrency = 6). Default is 1 to avoid
+// overwhelming the remote AI provider API. Anything beyond the limit waits
+// asynchronously for the next free slot, FIFO. This naturally throttles retries
+// too: each retry re-enters run() and must re-acquire a slot through the queue.
+// ---------------------------------------------------------------------------
+let _runActive = 0;
+const _runWaiters = [];
+
+function _concurrencyLimit() {
+  const n = Number(Agent.default.concurrency);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
+
+function _drainWaiters() {
+  while (_runWaiters.length && _runActive < _concurrencyLimit()) {
+    _runActive++;
+    const next = _runWaiters.shift();
+    next();
+  }
+}
+
+function _acquireRunSlot() {
+  if (_runActive < _concurrencyLimit()) {
+    _runActive++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => _runWaiters.push(resolve));
+}
+
+function _releaseRunSlot() {
+  _runActive = Math.max(0, _runActive - 1);
+  // A slot just freed — wake the next waiter(s) up to the current limit.
+  _drainWaiters();
+}
+
 export default class Agent {
   static default = {
     model: null,
@@ -69,6 +109,9 @@ export default class Agent {
     MAX_CTX_LEN: null,
     WIDE_MODEL: null,
     reasoning_effort: null,
+    // Max simultaneous in-flight Agent.run() calls (provider inference loops).
+    // Default 1 (serial). Set higher (e.g. 6) to parallelize.
+    concurrency: 1,
   };
 
   // tool registry
@@ -157,7 +200,19 @@ export default class Agent {
     return inst;
   }
 
-  async run({ prompt, ...ctx }) {
+  // Public entry point — enforces the global concurrency gate. Acquires a slot
+  // before running the provider inference loop and always releases it, even on
+  // error, so a thrown run() never leaks a slot.
+  async run(args) {
+    await _acquireRunSlot();
+    try {
+      return await this._runGated(args);
+    } finally {
+      _releaseRunSlot();
+    }
+  }
+
+  async _runGated({ prompt, ...ctx }) {
     const messages = [
       { role: 'system', content: this.system_prompt },
       { role: 'user', content: prompt },
