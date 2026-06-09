@@ -4,12 +4,71 @@ import * as copilot from './providers/copilot.mjs';
 import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
 
+// ---------------------------------------------------------------------------
+// Generic provider-call resilience (applies to ALL providers).
+// Retries on ANY error with exponential backoff + jitter, and enforces a
+// per-attempt timeout. Tunable via env:
+//   AGL_RETRY_ATTEMPTS (default 5)   AGL_RETRY_BASE_MS (default 1000)
+//   AGL_RETRY_MAX_MS  (default 30000) AGL_TIMEOUT_MS   (default 180000, 0=off)
+// ---------------------------------------------------------------------------
+
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function _retryConfig() {
+  return {
+    attempts: Math.max(1, Number(process.env.AGL_RETRY_ATTEMPTS || 5)),
+    baseMs: Number(process.env.AGL_RETRY_BASE_MS || 1000),
+    maxMs: Number(process.env.AGL_RETRY_MAX_MS || 30000),
+    timeoutMs: Number(process.env.AGL_TIMEOUT_MS ?? 180000),
+  };
+}
+
+// Race a promise against a timeout. The losing promise keeps a no-op handler
+// so a late rejection never surfaces as an unhandled rejection.
+function _withTimeout(promise, ms) {
+  if (!ms) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`agl: provider call timed out after ${ms}ms`)), ms);
+  });
+  promise.catch(() => {});
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Run an async provider call with timeout + retry/backoff on any error.
+// opts.timeoutMs overrides the default; pass 0 to disable the wall-clock
+// timeout (e.g. for streaming calls that govern themselves via an idle timer).
+async function _withRetry(fn, opts = {}) {
+  const cfg = _retryConfig();
+  const { attempts, baseMs, maxMs } = cfg;
+  const timeoutMs = opts.timeoutMs ?? cfg.timeoutMs;
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await _withTimeout(Promise.resolve().then(fn), timeoutMs);
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= attempts) break;
+      const backoff = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
+      const wait = backoff + Math.floor(Math.random() * 250);
+      console.warn(
+        `agl: provider call failed (${err?.name || 'Error'}: ${err?.message || err}); ` +
+        `retry ${attempt}/${attempts - 1} in ${wait}ms`,
+      );
+      debug('agl provider retry.', { attempt, wait, error: String(err?.message || err) });
+      await _sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
 export default class Agent {
   static default = {
     model: null,
     context_window: null,
     MAX_CTX_LEN: null,
     WIDE_MODEL: null,
+    reasoning_effort: null,
   };
 
   // tool registry
@@ -44,11 +103,14 @@ export default class Agent {
     return tools;
   }
 
-  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools } = {}) {
+  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools, reasoning_effort, max_tokens, stream } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
     inst.context_window = context_window ?? Agent.default.context_window ?? null;
     inst.parallel_tools = parallel_tools ?? false;
+    inst.reasoning_effort = reasoning_effort ?? Agent.default.reasoning_effort ?? null;
+    inst.max_tokens = max_tokens ?? null;
+    inst.stream = stream ?? false;
     if (!resolvedModel) {
       throw new Error('Agent.factory requires model or Agent.default.model');
     }
@@ -125,6 +187,10 @@ export default class Agent {
       const req = { model: activeModel, messages };
       if (hasTools) req.tools = this._renderTools();
       if (this.tool_choice) req.tool_choice = this.tool_choice;
+      if (this.reasoning_effort) req.reasoning_effort = this.reasoning_effort;
+      if (this.context_window) req.context_window = this.context_window;
+      if (this.max_tokens) req.max_tokens = this.max_tokens;
+      if (this.stream) req.stream = this.stream;
 
       if (this.context_window) {
         let chars = 0;
@@ -140,7 +206,13 @@ export default class Agent {
         }
       }
 
-      const result = await activeClient.inference(req);
+      // Streaming calls self-govern via the provider's idle timeout, so disable
+      // the agent-level wall-clock timeout (a long-but-progressing generation
+      // must not be killed mid-stream).
+      const result = await _withRetry(
+        () => activeClient.inference(req),
+        this.stream ? { timeoutMs: 0 } : {},
+      );
       debug('Agent.run result.', result);
 
       // common response shape:

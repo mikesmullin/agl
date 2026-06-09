@@ -153,7 +153,7 @@ export async function init() {
   _tokens = await _getSession();
 }
 
-async function _request({ method, uri, body }) {
+async function _request({ method, uri, body, extraHeaders, signal }) {
   if (!_tokens) throw new Error('copilot: call init() first');
   const url = `${_tokens.api_url}${uri}`;
   const opts = {
@@ -166,30 +166,61 @@ async function _request({ method, uri, body }) {
       'User-Agent': _config.copilot.user_agent,
       'Copilot-Integration-Id': _config.copilot.integration_id,
       'OpenAI-Intent': 'conversation-panel',
+      ...(extraHeaders || {}),
     },
   };
+  if (signal) opts.signal = signal;
   if (body) opts.body = JSON.stringify(body);
   debug('copilot _request.', { method, uri, body });
+
+  // NOTE: retry/backoff and per-call timeout are handled generically in the
+  // agent provider-invocation loop (applies to all providers), not here.
   const res = await fetch(url, opts);
   if (res.status === 401) {
     console.warn('Copilot token expired, refreshing...');
     _tokens = await _getSession();
-    return _request({ method, uri, body });
+    return _request({ method, uri, body, extraHeaders });
   }
 
   if (res.ok) {
     return res;
   }
-  else {
-    const errorDetails = {
-      status: res.status,
-      statusText: res.statusText,
-      headers: Object.fromEntries(res.headers),
-      body: await res.text()
-    };
-    debug('Copilot _request response.', errorDetails);
-    throw new Error(`Copilot Request error: ${res.status} ${res.statusText}`);
+
+  // Read the body once and surface the provider's own error detail in the
+  // thrown message so callers get actionable info WITHOUT needing DEBUG=1.
+  // The Copilot/OpenAI-compat error shape is: { error: { message, code, type, param } }.
+  const bodyText = await res.text();
+  const errorDetails = {
+    status: res.status,
+    statusText: res.statusText,
+    headers: Object.fromEntries(res.headers),
+    body: bodyText,
+  };
+  debug('Copilot _request response.', errorDetails);
+
+  let detail = '';
+  try {
+    const parsed = JSON.parse(bodyText);
+    const e = parsed?.error ?? parsed;
+    if (e && typeof e === 'object') {
+      const parts = [];
+      if (e.message) parts.push(e.message);
+      const meta = [e.code, e.type, e.param].filter(Boolean).join(', ');
+      if (meta) parts.push(`(${meta})`);
+      detail = parts.join(' ');
+    } else if (typeof e === 'string') {
+      detail = e;
+    }
+  } catch {
+    // Non-JSON body (e.g. plain text like "unauthorized: token expired")
+    detail = bodyText.trim();
   }
+  detail = (detail || '').replace(/\s+/g, ' ').slice(0, 500);
+
+  throw new Error(
+    `Copilot Request error: ${res.status} ${res.statusText}` +
+    (detail ? ` — ${detail}` : ''),
+  );
 }
 
 export async function models() {
@@ -197,7 +228,108 @@ export async function models() {
   return await res.json();
 }
 
-export async function inference({ model = _defaultModel, messages, tools, tool_choice }) {
+// Consume an SSE stream (OpenAI-compat deltas) and assemble a single
+// non-streaming-shaped result: { choices:[{ message:{role,content}, finish_reason }], usage }.
+// `onChunk` (optional) is called after each network read to reset an idle timer.
+async function _consumeStream(res, onChunk) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let reasoning = '';
+  let role = 'assistant';
+  let finishReason = null;
+  let usage = null;
+  let id = null;
+  let model = null;
+
+  // Optional live progress telemetry to stderr (AGL_STREAM_PROGRESS=1).
+  // Prints visible chars + reasoning chars + est tok/s every
+  // AGL_STREAM_PROGRESS_MS (default 2000) so long "thinking" phases are visible.
+  const progress = process.env.AGL_STREAM_PROGRESS === '1';
+  const progressMs = Number(process.env.AGL_STREAM_PROGRESS_MS || 2000);
+  const startedAt = Date.now();
+  let firstTokenAt = null;
+  let firstContentAt = null;
+  let lastReport = startedAt;
+  const reportProgress = (final = false) => {
+    if (!progress) return;
+    const now = Date.now();
+    if (!final && now - lastReport < progressMs) return;
+    lastReport = now;
+    const secs = (now - startedAt) / 1000;
+    const estTok = Math.ceil(content.length / 4);
+    const estThink = Math.ceil(reasoning.length / 4);
+    const ttft = firstTokenAt ? `${((firstTokenAt - startedAt) / 1000).toFixed(1)}s` : '—';
+    const ttc = firstContentAt ? `${((firstContentAt - startedAt) / 1000).toFixed(1)}s` : '—';
+    const phase = content.length === 0 && reasoning.length > 0 ? 'THINKING' : 'writing';
+    process.stderr.write(
+      `[stream] ${final ? 'done ' : ''}t=${secs.toFixed(1)}s ${phase}  content=${content.length}c(~${estTok}t)  reasoning=${reasoning.length}c(~${estThink}t)  ttft=${ttft} ttc=${ttc}\n`
+    );
+  };
+
+  const handleEvent = (jsonStr) => {
+    if (jsonStr === '[DONE]') return;
+    let evt;
+    try { evt = JSON.parse(jsonStr); } catch { return; }
+    if (evt.id) id = evt.id;
+    if (evt.model) model = evt.model;
+    if (evt.usage) usage = evt.usage;
+    const choice = evt.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta || {};
+    if (delta.role) role = delta.role;
+    // Capture reasoning/thinking deltas (Anthropic-via-Copilot extended thinking).
+    const rt = delta.reasoning_text ?? delta.reasoning ?? delta.thinking;
+    if (typeof rt === 'string' && rt) {
+      if (firstTokenAt === null) firstTokenAt = Date.now();
+      reasoning += rt;
+    }
+    const before = content.length;
+    if (typeof delta.content === 'string') content += delta.content;
+    // Some gateways stream Anthropic-style content arrays.
+    else if (Array.isArray(delta.content)) {
+      for (const b of delta.content) if (b?.type === 'text' && b.text) content += b.text;
+    }
+    if (content.length > before) {
+      if (firstTokenAt === null) firstTokenAt = Date.now();
+      if (firstContentAt === null) firstContentAt = Date.now();
+    }
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (onChunk) onChunk();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line || !line.startsWith('data:')) continue;
+      handleEvent(line.slice(5).trim());
+    }
+    reportProgress();
+  }
+  // flush any trailing buffered line
+  const tail = buffer.trim();
+  if (tail.startsWith('data:')) handleEvent(tail.slice(5).trim());
+  reportProgress(true);
+
+  debug('copilot stream assembled.', { id, model, finishReason, contentLen: content.length, usage });
+
+  return {
+    id,
+    model,
+    choices: [
+      { index: 0, message: { role, content }, finish_reason: finishReason || 'stop' },
+    ],
+    usage: usage || undefined,
+  };
+}
+
+export async function inference({ model = _defaultModel, messages, tools, tool_choice, reasoning_effort, context_window, max_tokens, stream }) {
   // Normalize messages: convert any Anthropic-native tool_result user messages
   // back to OpenAI tool messages (handles round-trips with claude-* models that
   // return Anthropic-native format through the Copilot enterprise endpoint)
@@ -222,13 +354,50 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
     return msg;
   });
 
+  const requestBody = {
+    model,
+    messages: normalizedMessages,
+    tools,
+    // tool_choice,
+  };
+  // Optional Anthropic-via-Copilot reasoning control (low|medium|high|xhigh|max).
+  if (reasoning_effort) requestBody.reasoning_effort = reasoning_effort;
+  if (max_tokens) requestBody.max_tokens = max_tokens;
+
+  // Opt-in extended/1M context for models that gate it behind a beta header.
+  const extraHeaders = {};
+  if (context_window && context_window > 200000) {
+    extraHeaders['anthropic-beta'] = 'context-1m-2025-08-07';
+  }
+
+  // Streaming path: raises the effective output cap (non-streaming responses are
+  // capped at ~16k tokens and return empty choices when exceeded). Used for long
+  // text generations that have no tools. Returns the same OpenAI-compat shape.
+  //
+  // Streams use an IDLE timeout (abort only if no chunk arrives for a while), not
+  // a wall-clock cap — a long-but-progressing generation must not be killed.
+  if (stream && (!tools || tools.length === 0)) {
+    requestBody.stream = true;
+    const idleMs = Number(process.env.AGL_STREAM_IDLE_MS || 120000);
+    const controller = new AbortController();
+    let idleTimer = setTimeout(() => controller.abort(), idleMs);
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), idleMs);
+    };
+    try {
+      const res = await _request({
+        method: 'POST', uri: '/chat/completions', body: requestBody, extraHeaders,
+        signal: controller.signal,
+      });
+      return await _consumeStream(res, resetIdle);
+    } finally {
+      clearTimeout(idleTimer);
+    }
+  }
+
   const res = await _request({
-    method: 'POST', uri: '/chat/completions', body: {
-      model,
-      messages: normalizedMessages,
-      tools,
-      // tool_choice,
-    },
+    method: 'POST', uri: '/chat/completions', body: requestBody, extraHeaders,
   });
   const result = await res.json();
 
