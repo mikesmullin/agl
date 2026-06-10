@@ -186,7 +186,10 @@ export default class Agent {
       inst.output_tool_name = output_tool?.name || 'final_result';
       inst.Tool(
         inst.output_tool_name,
-        output_tool?.description || '',
+        // NOTE: must never be empty — the Copilot endpoint rejects requests
+        // (400 Bad Request) when a tool has an empty description and the
+        // messages contain image content.
+        output_tool?.description || 'Report the final result.',
         output_tool?.parameters || { output: { type: output_tool?.type } },
         output_tool?.required || ['output'],
         output_tool?.fn || ((ctx, args) => {

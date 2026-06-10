@@ -370,6 +370,13 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
     extraHeaders['anthropic-beta'] = 'context-1m-2025-08-07';
   }
 
+  // Vision: Copilot requires this header when any message carries image content
+  // (OpenAI-style content arrays with { type: 'image_url' } parts).
+  const hasImages = normalizedMessages.some(
+    (m) => Array.isArray(m.content) && m.content.some((p) => p?.type === 'image_url'),
+  );
+  if (hasImages) extraHeaders['Copilot-Vision-Request'] = 'true';
+
   // Streaming path: raises the effective output cap (non-streaming responses are
   // capped at ~16k tokens and return empty choices when exceeded). Used for long
   // text generations that have no tools. Returns the same OpenAI-compat shape.
