@@ -120,11 +120,30 @@ async function _authenticate() {
 
 // --- session: load / refresh / auth ---
 
-async function _getSession() {
+// Deduplicate concurrent session refreshes. When many Agent.factory()/init()
+// calls run in parallel (e.g. a parallelized batch), they would otherwise each
+// see the same expired token and each hit the refresh endpoint. Instead, the
+// first caller starts the refresh and stores its promise here; everyone else
+// awaits the same promise and reuses the freshly-minted token.
+let _sessionPromise = null;
+
+async function _getSession({ force = false } = {}) {
+  // A valid cached token needs no coordination — return it immediately.
+  if (!force && _tokens?.copilot_token && _tokens.expires_at * 1000 > Date.now()) {
+    return _tokens;
+  }
+  if (_sessionPromise) return _sessionPromise;
+  _sessionPromise = _refreshSession({ force }).finally(() => {
+    _sessionPromise = null;
+  });
+  return _sessionPromise;
+}
+
+async function _refreshSession({ force = false } = {}) {
   let tokens = await _loadTokens();
 
-  // valid copilot token
-  if (tokens?.copilot_token && tokens.expires_at * 1000 > Date.now()) {
+  // valid copilot token (another process may have just refreshed it on disk)
+  if (!force && tokens?.copilot_token && tokens.expires_at * 1000 > Date.now()) {
     return tokens;
   }
 
@@ -178,7 +197,7 @@ async function _request({ method, uri, body, extraHeaders, signal }) {
   const res = await fetch(url, opts);
   if (res.status === 401) {
     console.warn('Copilot token expired, refreshing...');
-    _tokens = await _getSession();
+    _tokens = await _getSession({ force: true });
     return _request({ method, uri, body, extraHeaders });
   }
 
