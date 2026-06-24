@@ -13,7 +13,8 @@
     "src/agent.mjs",
     "src/lib/config.mjs",
     "src/lib/debug.mjs",
-    "src/providers/"
+    "src/providers/",
+    "docs/"
   ],
   "keywords": [
     "ai",
