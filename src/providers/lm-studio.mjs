@@ -54,3 +54,18 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
   });
   return await response.json();
 }
+
+// request embeddings (openai-compatible). LM Studio serves an embedding model
+// (e.g. `text-embedding-nomic-embed-text-v1.5`) at /v1/embeddings. Load an
+// embedding model in LM Studio and pass its id as `model`.
+// Returns the OpenAI-compat shape: { object, data:[{ index, embedding }], model, usage }.
+export async function embeddings({ model, input }) {
+  if (!model) throw new Error('lm-studio.embeddings: model is required');
+  const arr = Array.isArray(input) ? input : [input];
+  const response = await _request({
+    method: 'POST',
+    uri: '/v1/embeddings',
+    body: { model, input: arr },
+  });
+  return await response.json();
+}

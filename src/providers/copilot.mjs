@@ -465,3 +465,16 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
 
   return result;
 }
+
+// request embeddings (openai-compatible).
+// NOTE: the Copilot endpoint REQUIRES `input` to be an ARRAY — a bare string
+// returns 400 Bad Request. We normalize a single string to a one-element array.
+// Returns the OpenAI-compat shape: { object, data:[{ index, embedding }], model, usage }.
+export async function embeddings({ model, input }) {
+  if (!model) throw new Error('copilot.embeddings: model is required');
+  const arr = Array.isArray(input) ? input : [input];
+  const res = await _request({
+    method: 'POST', uri: '/embeddings', body: { model, input: arr },
+  });
+  return await res.json();
+}

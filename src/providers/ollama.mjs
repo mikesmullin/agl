@@ -86,3 +86,21 @@ export async function inference({ model = _defaultModel, messages, tools }) {
     },
   };
 }
+
+// request embeddings. Ollama's native /api/embed returns { embeddings: [[...]] };
+// we normalize to the OpenAI-compat shape: { model, data:[{ index, embedding }], usage }.
+// Pull an embedding model first (e.g. `ollama pull nomic-embed-text`) and pass its id.
+export async function embeddings({ model, input }) {
+  if (!model) throw new Error('ollama.embeddings: model is required');
+  const arr = Array.isArray(input) ? input : [input];
+  const response = await _request({ method: 'POST', uri: '/api/embed', body: { model, input: arr } });
+  const data = await response.json();
+  return {
+    model: data.model || model,
+    data: (data.embeddings || []).map((embedding, index) => ({ object: 'embedding', index, embedding })),
+    usage: {
+      prompt_tokens: data.prompt_eval_count || 0,
+      total_tokens: data.prompt_eval_count || 0,
+    },
+  };
+}

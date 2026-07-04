@@ -109,6 +109,8 @@ export default class Agent {
     MAX_CTX_LEN: null,
     WIDE_MODEL: null,
     reasoning_effort: null,
+    // Default "provider:model" spec for Agent.embed() when none is passed.
+    embed_model: null,
     // Max simultaneous in-flight Agent.run() calls (provider inference loops).
     // Default 1 (serial). Set higher (e.g. 6) to parallelize.
     concurrency: 1,
@@ -363,9 +365,33 @@ export default class Agent {
     }
   }
 
+  // Compute embeddings for text via a provider, resolved from a "provider:model"
+  // spec (e.g. "copilot:text-embedding-3-small", "lm-studio:text-embedding-nomic-embed-text-v1.5").
+  // `input` may be a string or an array of strings. Returns the OpenAI-compat
+  // shape { model, data:[{ index, embedding }], usage }. Wrapped in the same
+  // retry/backoff resilience as inference.
+  static async embed({ model, input } = {}) {
+    const resolved = model || Agent.default.embed_model;
+    if (!resolved) {
+      throw new Error('Agent.embed requires model or Agent.default.embed_model');
+    }
+    const idx = resolved.indexOf(':');
+    if (idx <= 0 || idx >= resolved.length - 1) {
+      throw new Error(`Invalid model format: ${resolved}. Expected "provider:model".`);
+    }
+    const provider = resolved.slice(0, idx);
+    const modelId = resolved.slice(idx + 1);
+    const client = { xai, copilot, ollama, 'lm-studio': lmstudio }[provider];
+    if (!client) throw new Error(`Unknown provider: ${provider}`);
+    if (typeof client.embeddings !== 'function') {
+      throw new Error(`Provider ${provider} does not support embeddings`);
+    }
+    await client.init();
+    return await _withRetry(() => client.embeddings({ model: modelId, input }));
+  }
+
   // Extract the last assistant response content from a result object
-  static lastAssistantResponse(result) {
-    const choices = result?.choices || [];
+  static lastAssistantResponse(result) {    const choices = result?.choices || [];
     for (let i = choices.length - 1; i >= 0; i--) {
       const msg = choices[i]?.message;
       if (msg?.role === 'assistant' && msg?.content) {
