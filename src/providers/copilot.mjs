@@ -4,7 +4,7 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { resolve, dirname } from 'path';
 
 const _tokensPath = resolve(import.meta.dir, '../../.copilot_tokens.json');
-const _defaultModel = 'claude-sonnet-4.6';
+const _defaultModel = 'claude-sonnet-5';
 
 const _config = {
   github: {
