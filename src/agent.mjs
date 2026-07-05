@@ -148,7 +148,7 @@ export default class Agent {
     return tools;
   }
 
-  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools, reasoning_effort, max_tokens, stream } = {}) {
+  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools, reasoning_effort, max_tokens, stream, on_delta } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
     inst.context_window = context_window ?? Agent.default.context_window ?? null;
@@ -156,6 +156,7 @@ export default class Agent {
     inst.reasoning_effort = reasoning_effort ?? Agent.default.reasoning_effort ?? null;
     inst.max_tokens = max_tokens ?? null;
     inst.stream = stream ?? false;
+    inst.on_delta = on_delta ?? null;
     if (!resolvedModel) {
       throw new Error('Agent.factory requires model or Agent.default.model');
     }
@@ -251,6 +252,7 @@ export default class Agent {
       if (this.context_window) req.context_window = this.context_window;
       if (this.max_tokens) req.max_tokens = this.max_tokens;
       if (this.stream) req.stream = this.stream;
+      if (this.stream && this.on_delta) req.on_delta = this.on_delta;
 
       if (this.context_window) {
         let chars = 0;
