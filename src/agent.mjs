@@ -6,7 +6,7 @@ import * as lmstudio from './providers/lm-studio.mjs';
 
 // ---------------------------------------------------------------------------
 // Generic provider-call resilience (applies to ALL providers).
-// Retries on ANY error with exponential backoff + jitter, and enforces a
+// Retries transient errors with exponential backoff + jitter, and enforces a
 // per-attempt timeout. Tunable via env:
 //   AGL_RETRY_ATTEMPTS (default 5)   AGL_RETRY_BASE_MS (default 1000)
 //   AGL_RETRY_MAX_MS  (default 30000) AGL_TIMEOUT_MS   (default 180000, 0=off)
@@ -35,10 +35,33 @@ function _withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// Run an async provider call with timeout + retry/backoff on any error.
+// HTTP 4xx request/capability errors are deterministic except for timeout,
+// conflict, early-data, and rate-limit responses. Retrying those bad requests
+// only occupies a concurrency slot and repeats the same provider rejection.
+export function isRetryableProviderError(err) {
+  const status = Number(err?.status);
+  if (Number.isFinite(status)) {
+    if (status === 400 && err?.model) {
+      const message = String(err?.message || '');
+      const contradictoryModelRoute = message.includes('requested model is not available')
+        && message.includes('Available models:')
+        && message.includes(String(err.model));
+      if (contradictoryModelRoute) return true;
+    }
+    return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+  }
+  const name = String(err?.name || '');
+  const code = String(err?.code || '');
+  const message = String(err?.message || err || '').toLowerCase();
+  if (name === 'AbortError' || message.includes('timed out') || message.includes('timeout')) return true;
+  if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'ENETDOWN', 'ENETUNREACH', 'EAI_AGAIN'].includes(code)) return true;
+  return err?.retryable !== false;
+}
+
+// Run an async provider call with timeout + retry/backoff on transient errors.
 // opts.timeoutMs overrides the default; pass 0 to disable the wall-clock
 // timeout (e.g. for streaming calls that govern themselves via an idle timer).
-async function _withRetry(fn, opts = {}) {
+export async function withProviderRetry(fn, opts = {}) {
   const cfg = _retryConfig();
   const { attempts, baseMs, maxMs } = cfg;
   const timeoutMs = opts.timeoutMs ?? cfg.timeoutMs;
@@ -48,7 +71,7 @@ async function _withRetry(fn, opts = {}) {
       return await _withTimeout(Promise.resolve().then(fn), timeoutMs);
     } catch (err) {
       lastErr = err;
-      if (attempt >= attempts) break;
+      if (attempt >= attempts || !isRetryableProviderError(err)) break;
       const backoff = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
       const wait = backoff + Math.floor(Math.random() * 250);
       console.warn(
@@ -104,7 +127,7 @@ function _releaseRunSlot() {
 
 export default class Agent {
   static default = {
-    model: null,
+    model: 'copilot:claude-sonnet-5',
     context_window: null,
     MAX_CTX_LEN: null,
     WIDE_MODEL: null,
@@ -271,7 +294,7 @@ export default class Agent {
       // Streaming calls self-govern via the provider's idle timeout, so disable
       // the agent-level wall-clock timeout (a long-but-progressing generation
       // must not be killed mid-stream).
-      const result = await _withRetry(
+      const result = await withProviderRetry(
         () => activeClient.inference(req),
         this.stream ? { timeoutMs: 0 } : {},
       );
@@ -389,7 +412,7 @@ export default class Agent {
       throw new Error(`Provider ${provider} does not support embeddings`);
     }
     await client.init();
-    return await _withRetry(() => client.embeddings({ model: modelId, input }));
+    return await withProviderRetry(() => client.embeddings({ model: modelId, input }));
   }
 
   // Extract the last assistant response content from a result object

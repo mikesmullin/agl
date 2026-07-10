@@ -236,15 +236,100 @@ async function _request({ method, uri, body, extraHeaders, signal }) {
   }
   detail = (detail || '').replace(/\s+/g, ' ').slice(0, 500);
 
-  throw new Error(
+  const error = new Error(
     `Copilot Request error: ${res.status} ${res.statusText}` +
     (detail ? ` — ${detail}` : ''),
   );
+  error.status = res.status;
+  error.statusText = res.statusText;
+  error.model = body?.model;
+  try {
+    const parsed = JSON.parse(bodyText);
+    const providerError = parsed?.error ?? parsed;
+    error.code = providerError?.code;
+    error.type = providerError?.type;
+    error.param = providerError?.param;
+  } catch {}
+  throw error;
 }
 
 export async function models() {
   const res = await _request({ method: 'GET', uri: '/models' });
   return await res.json();
+}
+
+// New OpenAI-family Copilot models (currently GPT-5.6 Luna) are exposed only
+// through the Responses API. Keep the provider's public return shape
+// OpenAI-chat-compatible so Agent's existing tool loop remains unchanged.
+const _responsesModels = new Set(['gpt-5.6-luna']);
+
+function _responsesInput(messages) {
+  const input = [];
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      input.push({ type: 'function_call_output', call_id: message.tool_call_id, output: typeof message.content === 'string' ? message.content : JSON.stringify(message.content) });
+      continue;
+    }
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      if (message.content) input.push({ role: 'assistant', content: [{ type: 'output_text', text: String(message.content) }] });
+      for (const call of message.tool_calls) input.push({
+        type: 'function_call', call_id: call.id, name: call.function?.name,
+        arguments: call.function?.arguments || '{}',
+      });
+      continue;
+    }
+    const raw = Array.isArray(message.content) ? message.content : [{ type: 'text', text: String(message.content ?? '') }];
+    const content = raw.map((part) => {
+      if (part?.type === 'image_url') return { type: 'input_image', image_url: part.image_url?.url };
+      return { type: 'input_text', text: String(part?.text ?? part?.content ?? '') };
+    });
+    input.push({ role: message.role, content });
+  }
+  return input;
+}
+
+function _responsesTools(tools) {
+  return (tools || []).map((tool) => ({
+    type: 'function', name: tool.function?.name, description: tool.function?.description,
+    parameters: tool.function?.parameters || { type: 'object', properties: {} },
+  }));
+}
+
+async function _responsesInference({ model, messages, tools, reasoning_effort, max_tokens }) {
+  const body = { model, input: _responsesInput(messages), store: false };
+  const convertedTools = _responsesTools(tools);
+  if (convertedTools.length) body.tools = convertedTools;
+  if (reasoning_effort) body.reasoning = { effort: reasoning_effort };
+  if (max_tokens) body.max_output_tokens = max_tokens;
+  const hasImages = messages.some((message) => Array.isArray(message.content) && message.content.some((part) => part?.type === 'image_url'));
+  const extraHeaders = hasImages ? { 'Copilot-Vision-Request': 'true' } : {};
+  const res = await _request({ method: 'POST', uri: '/responses', body, extraHeaders });
+  const result = await res.json();
+  const toolCalls = [];
+  const texts = [];
+  for (const item of result.output || []) {
+    if (item.type === 'function_call') toolCalls.push({
+      id: item.call_id || item.id, type: 'function',
+      function: { name: item.name, arguments: item.arguments || '{}' },
+    });
+    if (item.type === 'message') {
+      for (const part of item.content || []) if (part.type === 'output_text' && part.text) texts.push(part.text);
+    }
+  }
+  return {
+    id: result.id, model: result.model || model,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: texts.join('') || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+      finish_reason: toolCalls.length ? 'tool_calls' : (result.status === 'completed' ? 'stop' : result.status),
+    }],
+    usage: result.usage ? {
+      prompt_tokens: result.usage.input_tokens,
+      completion_tokens: result.usage.output_tokens,
+      total_tokens: result.usage.total_tokens,
+    } : undefined,
+    _responses: result,
+  };
 }
 
 // Consume an SSE stream (OpenAI-compat deltas) and assemble a single
@@ -372,6 +457,10 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
     }
     return msg;
   });
+
+  if (_responsesModels.has(model)) {
+    return await _responsesInference({ model, messages: normalizedMessages, tools, reasoning_effort, max_tokens });
+  }
 
   const requestBody = {
     model,
