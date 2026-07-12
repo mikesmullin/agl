@@ -3,43 +3,66 @@ import * as config from '../lib/config.mjs';
 
 let _key = '';
 const _baseUrl = 'https://api.x.ai';
-const _defaultModel = 'grok-4-1-fast-reasoning';
+/** Default model: Grok 4.5 (chat completions API model id). */
+const _defaultModel = 'grok-4.5';
+
+/** Known xAI chat models (subset; API may return more via models()). */
+export const KNOWN_MODELS = [
+  'grok-4.5',
+  'grok-4-1-fast-reasoning',
+  'grok-4-0709',
+  'grok-3',
+  'grok-3-mini',
+  'grok-2-1212',
+];
 
 // initialize provider
 export async function init() {
-  _key = await config.read('XAI_API_KEY')
+  _key = await config.read('XAI_API_KEY');
 
   if (!_key) {
-    console.error('XAI_API_KEY is missing.');
-    process.exit(1);
+    // Prefer soft failure so importers can fall back; CLI scripts may still exit.
+    const err = new Error('XAI_API_KEY is missing.');
+    err.code = 'MISSING_XAI_API_KEY';
+    throw err;
   }
 }
 
+export function defaultModel() {
+  return _defaultModel;
+}
+
 // make an api request
-async function _request({ method, uri, body = {} }) {
-  const _body = JSON.stringify(body);
-  debug('xai _request.', { method, uri, body });
-  const response = await fetch(`${_baseUrl}${uri}`, {
+async function _request({ method, uri, body }) {
+  if (!_key) {
+    await init();
+  }
+  const opts = {
     method,
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${_key}`
+      Authorization: `Bearer ${_key}`,
     },
-    body: _body,
-  });
+  };
+  if (body !== undefined) {
+    opts.body = JSON.stringify(body);
+  }
+  debug('xai _request.', { method, uri, body: body ? { ...body, messages: body.messages ? `[${body.messages.length}]` : undefined } : undefined });
+  const response = await fetch(`${_baseUrl}${uri}`, opts);
   if (response.ok) {
     return response;
   }
-  else {
-    const errorDetails = {
-      status: response.status,
-      statusText: response.statusText,
-      headers: Object.fromEntries(response.headers),
-      body: await response.text()
-    };
-    debug('xAI _request response.', errorDetails);
-    throw new Error(`XAI Request error: ${response.status} ${response.statusText}`);
-  }
+  const errorDetails = {
+    status: response.status,
+    statusText: response.statusText,
+    headers: Object.fromEntries(response.headers),
+    body: await response.text(),
+  };
+  debug('xAI _request response.', errorDetails);
+  const err = new Error(`XAI Request error: ${response.status} ${response.statusText}`);
+  err.status = response.status;
+  err.body = errorDetails.body;
+  throw err;
 }
 
 // list available models
@@ -48,16 +71,51 @@ export async function models() {
   return await response.json();
 }
 
-// request a completion
-export async function inference({ model = _defaultModel, messages, tools, tool_choice }) {
-  // openai-compatible
+/**
+ * Chat completion (OpenAI-compatible).
+ * @param {{ model?: string, messages: object[], tools?: object[], tool_choice?: any, max_tokens?: number }} opts
+ */
+export async function inference({
+  model = _defaultModel,
+  messages,
+  tools,
+  tool_choice,
+  max_tokens,
+} = {}) {
+  const body = {
+    model: model || _defaultModel,
+    messages,
+  };
+  if (tools?.length) body.tools = tools;
+  if (tool_choice !== undefined) body.tool_choice = tool_choice;
+  if (max_tokens != null) body.max_tokens = max_tokens;
+
   const response = await _request({
-    method: 'POST', uri: '/v1/chat/completions', body: {
-      model,
-      messages,
-      tools,
-      tool_choice,
-    }
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body,
   });
   return await response.json();
+}
+
+/**
+ * Lightweight smoke: one short completion with grok-4.5 (or `model`).
+ * Returns { ok, model, previewLen, id? } without dumping content.
+ */
+export async function smokeInference({ model = _defaultModel } = {}) {
+  const data = await inference({
+    model,
+    messages: [
+      { role: 'system', content: 'Reply with exactly one short sentence.' },
+      { role: 'user', content: 'Say hello in five words or fewer.' },
+    ],
+    max_tokens: 32,
+  });
+  const content = data?.choices?.[0]?.message?.content ?? '';
+  return {
+    ok: Boolean(content && content.length > 0),
+    model: data?.model || model,
+    previewLen: content.length,
+    id: data?.id || null,
+  };
 }
