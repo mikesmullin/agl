@@ -263,7 +263,7 @@ export async function models() {
 // OpenAI-chat-compatible so Agent's existing tool loop remains unchanged.
 const _responsesModels = new Set(['gpt-5.6-luna']);
 
-function _responsesInput(messages) {
+export function responsesInput(messages) {
   const input = [];
   for (const message of messages) {
     if (message.role === 'tool') {
@@ -281,7 +281,13 @@ function _responsesInput(messages) {
     const raw = Array.isArray(message.content) ? message.content : [{ type: 'text', text: String(message.content ?? '') }];
     const content = raw.map((part) => {
       if (part?.type === 'image_url') return { type: 'input_image', image_url: part.image_url?.url };
-      return { type: 'input_text', text: String(part?.text ?? part?.content ?? '') };
+      // Copilot's Responses endpoint follows the OpenAI role distinction:
+      // user/system input uses input_text, while replayed assistant history
+      // must use output_text (the Luna tool loop includes both forms).
+      return {
+        type: message.role === 'assistant' ? 'output_text' : 'input_text',
+        text: String(part?.text ?? part?.content ?? ''),
+      };
     });
     input.push({ role: message.role, content });
   }
@@ -295,10 +301,20 @@ function _responsesTools(tools) {
   }));
 }
 
-async function _responsesInference({ model, messages, tools, reasoning_effort, max_tokens }) {
-  const body = { model, input: _responsesInput(messages), store: false };
+export function responsesToolChoice(toolChoice) {
+  if (toolChoice == null || ['auto', 'none', 'required'].includes(toolChoice)) return toolChoice;
+  if (toolChoice?.type === 'function') {
+    return { type: 'function', name: toolChoice.name || toolChoice.function?.name };
+  }
+  return undefined;
+}
+
+async function _responsesInference({ model, messages, tools, tool_choice, reasoning_effort, max_tokens }) {
+  const body = { model, input: responsesInput(messages), store: false };
   const convertedTools = _responsesTools(tools);
   if (convertedTools.length) body.tools = convertedTools;
+  const convertedToolChoice = responsesToolChoice(tool_choice);
+  if (convertedToolChoice) body.tool_choice = convertedToolChoice;
   if (reasoning_effort) body.reasoning = { effort: reasoning_effort };
   if (max_tokens) body.max_output_tokens = max_tokens;
   const hasImages = messages.some((message) => Array.isArray(message.content) && message.content.some((part) => part?.type === 'image_url'));
@@ -459,7 +475,7 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
   });
 
   if (_responsesModels.has(model)) {
-    return await _responsesInference({ model, messages: normalizedMessages, tools, reasoning_effort, max_tokens });
+    return await _responsesInference({ model, messages: normalizedMessages, tools, tool_choice, reasoning_effort, max_tokens });
   }
 
   const requestBody = {

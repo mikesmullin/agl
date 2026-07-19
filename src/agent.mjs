@@ -127,7 +127,7 @@ function _releaseRunSlot() {
 
 export default class Agent {
   static default = {
-    model: 'copilot:claude-sonnet-5',
+    model: 'copilot:gpt-5.6-luna',
     context_window: null,
     MAX_CTX_LEN: null,
     WIDE_MODEL: null,
@@ -171,7 +171,7 @@ export default class Agent {
     return tools;
   }
 
-  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools, reasoning_effort, max_tokens, stream, on_delta, retain_history } = {}) {
+  static async factory({ model, system_prompt, output_tool, tool_choice, context_window, parallel_tools, reasoning_effort, max_tokens, stream, on_delta } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
     inst.context_window = context_window ?? Agent.default.context_window ?? null;
@@ -180,11 +180,6 @@ export default class Agent {
     inst.max_tokens = max_tokens ?? null;
     inst.stream = stream ?? false;
     inst.on_delta = on_delta ?? null;
-    // When true, each Agent.run() appends to this.history and the next run()
-    // sends the full multi-turn message list (system + prior user/assistant/tool
-    // turns). Default false preserves classic one-shot prompt/response behavior.
-    inst.retain_history = retain_history ?? false;
-    inst.history = [];
     if (!resolvedModel) {
       throw new Error('Agent.factory requires model or Agent.default.model');
     }
@@ -246,29 +241,11 @@ export default class Agent {
     }
   }
 
-  /** Drop retained multi-turn history (e.g. new chat session). System prompt stays. */
-  clearHistory() {
-    this.history = [];
-  }
-
   async _runGated({ prompt, ...ctx }) {
-    let messages;
-    if (this.retain_history) {
-      if (this.history.length === 0) {
-        this.history.push({ role: 'system', content: this.system_prompt });
-      } else if (this.history[0]?.role === 'system' && this.system_prompt != null
-          && this.history[0].content !== this.system_prompt) {
-        // Keep system message in sync if factory prompt was updated on the instance.
-        this.history[0] = { role: 'system', content: this.system_prompt };
-      }
-      this.history.push({ role: 'user', content: prompt });
-      messages = this.history;
-    } else {
-      messages = [
-        { role: 'system', content: this.system_prompt },
-        { role: 'user', content: prompt },
-      ];
-    }
+    const messages = [
+      { role: 'system', content: this.system_prompt },
+      { role: 'user', content: prompt },
+    ];
     const hasTools = Object.keys(this.tools).length > 0;
 
     let done = false;
@@ -351,17 +328,6 @@ export default class Agent {
           });
           debug('Agent nudging model to call output tool.', this.output_tool_name);
           continue;
-        }
-        // Freeform completion: keep assistant turn in retained history for next run().
-        if (this.retain_history) {
-          const assistantMsg = result.choices?.[0]?.message;
-          if (assistantMsg) {
-            messages.push({
-              role: 'assistant',
-              content: assistantMsg.content ?? '',
-              ...(assistantMsg.tool_calls ? { tool_calls: assistantMsg.tool_calls } : {}),
-            });
-          }
         }
         return result;
       }
