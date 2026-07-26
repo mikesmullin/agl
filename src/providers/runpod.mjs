@@ -90,8 +90,21 @@ export async function models() {
 }
 
 /**
- * Chat completion (OpenAI-compatible).
- * @param {{ model?: string, messages: object[], tools?: object[], tool_choice?: any, max_tokens?: number, temperature?: number, top_p?: number }} opts
+ * Chat completion (OpenAI-compatible / vLLM).
+ * Non-streaming by default — preferred while debugging Gemma 4 tool/reasoning loops.
+ *
+ * @param {{
+ *   model?: string,
+ *   messages: object[],
+ *   tools?: object[],
+ *   tool_choice?: any,
+ *   max_tokens?: number,
+ *   temperature?: number,
+ *   top_p?: number,
+ *   top_k?: number,
+ *   stream?: boolean,
+ *   chat_template_kwargs?: object,
+ * }} opts
  */
 export async function inference({
   model,
@@ -101,6 +114,9 @@ export async function inference({
   max_tokens,
   temperature,
   top_p,
+  top_k,
+  stream = false,
+  chat_template_kwargs,
 } = {}) {
   const resolved =
     model ||
@@ -110,15 +126,21 @@ export async function inference({
   const body = {
     model: resolved,
     messages,
+    stream: Boolean(stream),
   };
   if (tools?.length) body.tools = tools;
   if (tool_choice !== undefined) body.tool_choice = tool_choice;
   if (max_tokens != null) body.max_tokens = max_tokens;
-  // MiniMax recommended defaults when caller does not override
+  // Gemma 4 / many open models: temp=1.0, top_p=0.95 (model generation_config often agrees)
   if (temperature != null) body.temperature = temperature;
   else body.temperature = 1.0;
   if (top_p != null) body.top_p = top_p;
   else body.top_p = 0.95;
+  if (top_k != null) body.top_k = top_k;
+  // vLLM: enable Gemma thinking channel when server uses gemma4 chat template + reasoning parser
+  if (chat_template_kwargs && typeof chat_template_kwargs === 'object') {
+    body.chat_template_kwargs = chat_template_kwargs;
+  }
 
   const response = await _request({
     method: 'POST',
@@ -129,8 +151,8 @@ export async function inference({
 }
 
 /**
- * Lightweight smoke: one short completion.
- * Returns { ok, model, previewLen, id? } without dumping content.
+ * Lightweight smoke: one short completion (non-streaming).
+ * Accepts content or reasoning/reasoning_content so thinking-only replies still pass.
  */
 export async function smokeInference({ model } = {}) {
   const data = await inference({
@@ -139,13 +161,19 @@ export async function smokeInference({ model } = {}) {
       { role: 'system', content: 'Reply with exactly one short sentence.' },
       { role: 'user', content: 'Say hello in five words or fewer.' },
     ],
-    max_tokens: 32,
+    max_tokens: 64,
+    stream: false,
   });
-  const content = data?.choices?.[0]?.message?.content ?? '';
+  const msg = data?.choices?.[0]?.message || {};
+  const content = msg.content ?? '';
+  const reasoning = msg.reasoning_content ?? msg.reasoning ?? '';
+  const previewLen = String(content || reasoning || '').length;
   return {
-    ok: Boolean(content && content.length > 0),
+    ok: previewLen > 0,
     model: data?.model || model || _defaultModel,
-    previewLen: content.length,
+    previewLen,
     id: data?.id || null,
+    hasContent: Boolean(content && String(content).length),
+    hasReasoning: Boolean(reasoning && String(reasoning).length),
   };
 }
