@@ -62,6 +62,7 @@ These are supported.
 | Copilot | `copilot:<model>` | GitHub device-flow OAuth |
 | Ollama | `ollama:<model>` | None (localhost) |
 | LM Studio | `lm-studio:<model>` | None (localhost) |
+| RunPod | `runpod:<model>` | `RUNPOD_BASE_URL` (OpenAI-compatible pod proxy/tunnel) |
 
 Creating an `.env` file in the project root with your provider API key(s) is also supported.
 

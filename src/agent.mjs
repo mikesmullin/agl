@@ -3,6 +3,15 @@ import * as xai from './providers/xai.mjs';
 import * as copilot from './providers/copilot.mjs';
 import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
+import * as runpod from './providers/runpod.mjs';
+
+const PROVIDERS = {
+  xai,
+  copilot,
+  ollama,
+  'lm-studio': lmstudio,
+  runpod,
+};
 
 // ---------------------------------------------------------------------------
 // Generic provider-call resilience (applies to ALL providers).
@@ -191,7 +200,10 @@ export default class Agent {
       inst.provider = resolvedModel.slice(0, idx);
       inst.model = resolvedModel.slice(idx + 1);
     }
-    inst.client = { xai, copilot, ollama, 'lm-studio': lmstudio }[inst.provider];
+    inst.client = PROVIDERS[inst.provider];
+    if (!inst.client) {
+      throw new Error(`Unknown AI provider: ${inst.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
+    }
     inst.system_prompt = system_prompt;
     inst.tool_choice = tool_choice;
     await inst.client.init();
@@ -201,7 +213,7 @@ export default class Agent {
       const widx = wideModelSpec.indexOf(':');
       const wideProvider = widx > 0 && widx < wideModelSpec.length - 1 ? wideModelSpec.slice(0, widx) : null;
       inst._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
-      inst._wideClient = wideProvider ? { xai, copilot, ollama, 'lm-studio': lmstudio }[wideProvider] : inst.client;
+      inst._wideClient = wideProvider ? PROVIDERS[wideProvider] : inst.client;
       if (inst._wideClient && inst._wideClient !== inst.client) {
         await inst._wideClient.init();
       }
@@ -406,7 +418,7 @@ export default class Agent {
     }
     const provider = resolved.slice(0, idx);
     const modelId = resolved.slice(idx + 1);
-    const client = { xai, copilot, ollama, 'lm-studio': lmstudio }[provider];
+    const client = PROVIDERS[provider];
     if (!client) throw new Error(`Unknown provider: ${provider}`);
     if (typeof client.embeddings !== 'function') {
       throw new Error(`Provider ${provider} does not support embeddings`);
