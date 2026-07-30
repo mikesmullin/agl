@@ -9,7 +9,7 @@ let finalOutput = { output: null, summary: '(agent produced no summary)' };
 
 const agent = await Agent.factory({
   // model: 'ollama:gemma4:26b',
-  model: 'lm-studio:google/gemma-4-e4b',
+  model: process.env.FAV_LOCAL_LLM,
   parallel_tools: true,
   system_prompt:
     'You are a personal assistant agent.\n' +

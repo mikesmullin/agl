@@ -119,3 +119,16 @@ export async function smokeInference({ model = _defaultModel } = {}) {
     id: data?.id || null,
   };
 }
+
+/**
+ * Max context window (tokens) for an xAI / Grok model id.
+ * @param {string} model
+ * @returns {number}
+ */
+export function contextWindowSize(model) {
+  const m = String(model || '').toLowerCase();
+  if (m.includes('grok-4') || m.includes('grok4')) return 131_072;
+  if (m.includes('grok-3') || m.includes('grok3')) return 131_072;
+  if (m.includes('grok')) return 131_072;
+  return 131_072;
+}

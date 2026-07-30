@@ -177,3 +177,23 @@ export async function smokeInference({ model } = {}) {
     hasReasoning: Boolean(reasoning && String(reasoning).length),
   };
 }
+
+/**
+ * Max context window (tokens) for a RunPod-hosted model id.
+ * @param {string} model
+ * @returns {number}
+ */
+export function contextWindowSize(model) {
+  const m = String(model || '').toLowerCase();
+  // Gemma 4 MoE 26B-A4B — 256K
+  if (
+    m.includes('gemma4') ||
+    m.includes('gemma-4') ||
+    m.includes('26b-a4b') ||
+    m.includes('26b_a4b')
+  ) {
+    return 262_144;
+  }
+  if (m.includes('minimax') || m.includes('m3')) return 196_608;
+  return 32_768;
+}

@@ -104,3 +104,18 @@ export async function embeddings({ model, input }) {
     },
   };
 }
+
+/**
+ * Max context window (tokens) for an Ollama model id.
+ * Defaults are conservative; actual num_ctx may differ at pull/serve time.
+ * @param {string} model
+ * @returns {number}
+ */
+export function contextWindowSize(model) {
+  const m = String(model || '').toLowerCase();
+  if (m.includes('gemma')) return 32_768;
+  if (m.includes('qwen')) return 32_768;
+  if (m.includes('llama3') || m.includes('llama-3')) return 128_000;
+  if (m.includes('mistral') || m.includes('mixtral')) return 32_768;
+  return 32_768;
+}

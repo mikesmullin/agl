@@ -394,7 +394,31 @@ async function _consumeStream(res, onChunk) {
     try { evt = JSON.parse(jsonStr); } catch { return; }
     if (evt.id) id = evt.id;
     if (evt.model) model = evt.model;
-    if (evt.usage) usage = evt.usage;
+    if (evt.usage) {
+      // Normalize Responses-style input/output_tokens → OpenAI chat usage
+      const u = evt.usage;
+      const pt = Number(
+        u.prompt_tokens ?? u.promptTokens ?? u.input_tokens ?? u.inputTokens,
+      );
+      const ct = Number(
+        u.completion_tokens ??
+          u.completionTokens ??
+          u.output_tokens ??
+          u.outputTokens ??
+          0,
+      );
+      const tt = Number(
+        u.total_tokens ??
+          u.totalTokens ??
+          (Number.isFinite(pt) ? pt : 0) + (Number.isFinite(ct) ? ct : 0),
+      );
+      usage = {
+        ...u,
+        prompt_tokens: Number.isFinite(pt) ? pt : 0,
+        completion_tokens: Number.isFinite(ct) ? ct : 0,
+        total_tokens: Number.isFinite(tt) ? tt : 0,
+      };
+    }
     const choice = evt.choices?.[0];
     if (!choice) return;
     const delta = choice.delta || {};
@@ -449,7 +473,17 @@ async function _consumeStream(res, onChunk) {
   };
 }
 
-export async function inference({ model = _defaultModel, messages, tools, tool_choice, reasoning_effort, context_window, max_tokens, stream }) {
+export async function inference({
+  model = _defaultModel,
+  messages,
+  tools,
+  tool_choice,
+  reasoning_effort,
+  context_window,
+  max_tokens,
+  stream,
+  signal: parentSignal,
+}) {
   // Normalize messages: convert any Anthropic-native tool_result user messages
   // back to OpenAI tool messages (handles round-trips with claude-* models that
   // return Anthropic-native format through the Copilot enterprise endpoint)
@@ -509,6 +543,9 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
   // a wall-clock cap — a long-but-progressing generation must not be killed.
   if (stream && (!tools || tools.length === 0)) {
     requestBody.stream = true;
+    // OpenAI-compat: include final-chunk usage so pie uses provider counts
+    // (not chars/4). Harmless if the gateway ignores unknown fields.
+    requestBody.stream_options = { include_usage: true };
     const idleMs = Number(process.env.AGL_STREAM_IDLE_MS || 120000);
     const controller = new AbortController();
     let idleTimer = setTimeout(() => controller.abort(), idleMs);
@@ -516,19 +553,58 @@ export async function inference({ model = _defaultModel, messages, tools, tool_c
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => controller.abort(), idleMs);
     };
+    const onParentAbort = () => {
+      try {
+        controller.abort(
+          typeof parentSignal?.reason === 'string'
+            ? parentSignal.reason
+            : 'user stop',
+        );
+      } catch {
+        /* ignore */
+      }
+    };
+    if (parentSignal) {
+      if (parentSignal.aborted) onParentAbort();
+      else parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
     try {
       const res = await _request({
         method: 'POST', uri: '/chat/completions', body: requestBody, extraHeaders,
         signal: controller.signal,
       });
       return await _consumeStream(res, resetIdle);
+    } catch (err) {
+      if (parentSignal?.aborted || controller.signal.aborted) {
+        const e = new Error(
+          typeof parentSignal?.reason === 'string'
+            ? parentSignal.reason
+            : err?.message || 'user stop',
+        );
+        e.name = 'AbortError';
+        e.aborted = true;
+        e.userAbort = Boolean(parentSignal?.aborted);
+        throw e;
+      }
+      throw err;
     } finally {
       clearTimeout(idleTimer);
+      if (parentSignal) {
+        try {
+          parentSignal.removeEventListener('abort', onParentAbort);
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }
 
   const res = await _request({
-    method: 'POST', uri: '/chat/completions', body: requestBody, extraHeaders,
+    method: 'POST',
+    uri: '/chat/completions',
+    body: requestBody,
+    extraHeaders,
+    signal: parentSignal,
   });
   const result = await res.json();
 
@@ -582,4 +658,30 @@ export async function embeddings({ model, input }) {
     method: 'POST', uri: '/embeddings', body: { model, input: arr },
   });
   return await res.json();
+}
+
+/**
+ * Max context window (tokens) for a Copilot model id (no provider: prefix).
+ * Static table — Copilot does not expose this on the completion response.
+ *
+ * @param {string} model
+ * @returns {number}
+ */
+export function contextWindowSize(model) {
+  const m = String(model || '').toLowerCase();
+  // GPT-5.6 family (Luna / Terra / Sol) — 1M context
+  if (m.includes('gpt-5.6-luna') || m.includes('gpt-5.6-terra') || m.includes('gpt-5.6-sol')) {
+    return 1_000_000;
+  }
+  if (m.includes('gpt-5.6') || m.includes('gpt-5.5') || m.includes('gpt-5')) {
+    return 1_000_000;
+  }
+  // Claude via Copilot
+  if (m.includes('opus')) return 200_000;
+  if (m.includes('sonnet')) return 200_000;
+  if (m.includes('haiku')) return 200_000;
+  if (m.includes('fable')) return 200_000;
+  if (m.includes('claude')) return 200_000;
+  if (m.startsWith('gpt-4') || m.includes('gpt-4o')) return 128_000;
+  return 200_000; // Copilot enterprise default
 }
