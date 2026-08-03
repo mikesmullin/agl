@@ -119,11 +119,18 @@ function _retryConfig() {
 
 // Race a promise against a timeout. The losing promise keeps a no-op handler
 // so a late rejection never surfaces as an unhandled rejection.
-function _withTimeout(promise, ms) {
+// `ac` (optional AbortController) is aborted when the timeout fires, so the
+// underlying provider request is actually cancelled — without this, a
+// timed-out attempt keeps generating on the provider while the retry sends a
+// fresh one (snowballing load on local servers like LM Studio).
+function _withTimeout(promise, ms, ac) {
   if (!ms) return promise;
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`agl: provider call timed out after ${ms}ms`)), ms);
+    timer = setTimeout(() => {
+      try { ac?.abort(`agl: provider call timed out after ${ms}ms`); } catch { /* ignore */ }
+      reject(new Error(`agl: provider call timed out after ${ms}ms`));
+    }, ms);
   });
   promise.catch(() => {});
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
@@ -173,9 +180,20 @@ export function abortError(reason = 'aborted') {
 // Run an async provider call with timeout + retry/backoff on transient errors.
 // opts.timeoutMs overrides the default; pass 0 to disable the wall-clock
 // timeout (e.g. for streaming calls that govern themselves via an idle timer).
+//
+// fn is called with an attempt context `{ signal }` — an AbortSignal scoped to
+// THIS attempt that fires on (a) opts.signal abort (user stop) or (b) the
+// per-attempt timeout. Callers that thread it into their provider request get
+// true early-abort: the HTTP request is torn down instead of left running.
+// Callers that ignore the argument keep the old race-only behavior.
 export async function withProviderRetry(fn, opts = {}) {
   const cfg = _retryConfig();
-  const { attempts, baseMs, maxMs } = cfg;
+  // opts.attempts (total tries) overrides env; factory `retries: 0` → attempts: 1
+  const attempts = Math.max(
+    1,
+    Number.isFinite(opts.attempts) ? Math.floor(opts.attempts) : cfg.attempts,
+  );
+  const { baseMs, maxMs } = cfg;
   const timeoutMs = opts.timeoutMs ?? cfg.timeoutMs;
   const signal = opts.signal;
   let lastErr;
@@ -185,8 +203,21 @@ export async function withProviderRetry(fn, opts = {}) {
         typeof signal.reason === 'string' ? signal.reason : 'user stop',
       );
     }
+    const attemptAc = new AbortController();
+    const onOuterAbort = () => {
+      try {
+        attemptAc.abort(
+          typeof signal?.reason === 'string' ? signal.reason : 'user stop',
+        );
+      } catch { /* ignore */ }
+    };
+    if (signal) signal.addEventListener('abort', onOuterAbort, { once: true });
     try {
-      return await _withTimeout(Promise.resolve().then(fn), timeoutMs);
+      return await _withTimeout(
+        Promise.resolve().then(() => fn({ signal: attemptAc.signal })),
+        timeoutMs,
+        attemptAc,
+      );
     } catch (err) {
       lastErr = err;
       // User-cancelled stream: never retry
@@ -206,6 +237,8 @@ export async function withProviderRetry(fn, opts = {}) {
       );
       debug('agl provider retry.', { attempt, wait, error: String(err?.message || err) });
       await _sleep(wait);
+    } finally {
+      if (signal) signal.removeEventListener('abort', onOuterAbort);
     }
   }
   throw lastErr;
@@ -384,9 +417,20 @@ export default class Agent {
     stream,
     on_delta,
     retain_history,
+    // Number of *re*-tries after the first failure (0 = try once, never retry).
+    // Honored centrally by withProviderRetry for every provider. Prefer this
+    // over AGL_RETRY_ATTEMPTS when a caller (e.g. brain viz) needs cancel to
+    // stick and must not re-fire a stuck inference loop.
+    retries,
   } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
+    if (retries != null && Number.isFinite(Number(retries))) {
+      // retries=0 → 1 attempt; retries=2 → 3 attempts
+      inst.retry_attempts = Math.max(1, Math.floor(Number(retries)) + 1);
+    } else {
+      inst.retry_attempts = null; // fall through to env / default
+    }
 
     // Token budget (was historically named context_window as a number).
     let size =
@@ -465,6 +509,26 @@ export default class Agent {
     if (output_tool) {
       inst.last_output = null;
       inst.output_tool_name = output_tool?.name || 'final_result';
+      // Wrap output-tool fn so run() always gets last_output. Custom fns may be
+      // either (ctx, args) [AGL/Tool convention] or (args) [sheets stage contract];
+      // their return value becomes last_output (undefined → fall back to args).
+      const userOutFn = output_tool?.fn;
+      const outFn = async (ctx, args) => {
+        let result;
+        if (userOutFn) {
+          result =
+            userOutFn.length <= 1
+              ? await userOutFn(args)
+              : await userOutFn(ctx, args);
+          inst.last_output = result !== undefined ? result : args;
+        } else {
+          inst.last_output = Object.prototype.hasOwnProperty.call(args, 'output')
+            ? args.output
+            : args;
+          result = inst.last_output;
+        }
+        return result;
+      };
       inst.Tool(
         inst.output_tool_name,
         // NOTE: must never be empty — the Copilot endpoint rejects requests
@@ -473,9 +537,7 @@ export default class Agent {
         output_tool?.description || 'Report the final result.',
         output_tool?.parameters || { output: { type: output_tool?.type } },
         output_tool?.required || ['output'],
-        output_tool?.fn || ((ctx, args) => {
-          inst.last_output = Object.prototype.hasOwnProperty.call(args, 'output') ? args.output : args;
-        }));
+        outFn);
       if (!inst.tool_choice) {
         inst.tool_choice = 'required';
       }
@@ -487,10 +549,26 @@ export default class Agent {
   // Public entry point — enforces the global concurrency gate. Acquires a slot
   // before running the provider inference loop and always releases it, even on
   // error, so a thrown run() never leaks a slot.
+  //
+  // AbortController is created *before* the slot wait so abort() during queue
+  // wait still kills the run the moment it starts (and never lets a pre-run
+  // abort be silently cleared — that was the cancel race that left LM Studio
+  // decoding for minutes after the user hit Stop).
   async run(args) {
+    // Fresh controller for this run. If abort() already flipped `this.aborted`
+    // for a *previous* run we clear it here; if abort() races us after this
+    // assignment, the new controller is what it will abort.
+    this.aborted = false;
+    this._abortReason = null;
+    this._runAbort = new AbortController();
+    const runSignal = this._runAbort.signal;
+
     await _acquireRunSlot();
     try {
-      return await this._runGated(args);
+      if (this.aborted || runSignal.aborted) {
+        throw abortError(this._abortReason || 'user stop');
+      }
+      return await this._runGated(args, runSignal);
     } finally {
       _releaseRunSlot();
     }
@@ -499,6 +577,7 @@ export default class Agent {
   /**
    * Cancel the in-flight run: flag + abort the active provider AbortSignal so
    * streaming fetch/readers stop immediately (not only between tool loops).
+   * Safe to call before run(), during slot wait, or mid-stream.
    */
   abort(reason = 'aborted') {
     this.aborted = true;
@@ -616,12 +695,19 @@ export default class Agent {
     skip_user_append = false,
     user_id = null,
     ...ctx
-  } = {}) {
-    // Fresh cancel flag for each turn (Stop must not poison the next message).
-    this.aborted = false;
-    this._abortReason = null;
-    this._runAbort = new AbortController();
-    const runSignal = this._runAbort.signal;
+  } = {}, runSignal = null) {
+    // Prefer the controller created in run() (covers pre-slot abort). Fall
+    // back only if a caller invoked _runGated directly.
+    if (!runSignal) {
+      this.aborted = false;
+      this._abortReason = null;
+      this._runAbort = new AbortController();
+      runSignal = this._runAbort.signal;
+    }
+
+    if (this.aborted || runSignal.aborted) {
+      throw abortError(this._abortReason || 'user stop');
+    }
 
     if (!Array.isArray(this.context_window)) this.context_window = [];
 
@@ -700,14 +786,21 @@ export default class Agent {
       let result;
       try {
         result = await withProviderRetry(
-          () => activeClient.inference(req),
+          // attempt.signal aborts on user stop AND per-attempt timeout, so a
+          // timed-out attempt's HTTP request is torn down (frees the provider
+          // slot) instead of generating on in the background while we retry
+          (attempt) => activeClient.inference({
+            ...req,
+            signal: attempt?.signal ?? runSignal,
+          }),
           {
             ...(this.stream ? { timeoutMs: 0 } : {}),
             signal: runSignal,
+            ...(this.retry_attempts != null ? { attempts: this.retry_attempts } : {}),
           },
         );
       } catch (err) {
-        if (this.aborted || runSignal.aborted || err?.aborted) {
+        if (this.aborted || runSignal.aborted || err?.aborted || err?.userAbort) {
           throw abortError(this._abortReason || err?.message || 'user stop');
         }
         throw err;
