@@ -1,20 +1,9 @@
 import { debug } from '../lib/debug.mjs';
-import * as config from '../lib/config.mjs';
-import { readFile, writeFile, mkdir } from 'fs/promises';
-import { resolve, dirname } from 'path';
-
-const _tokensPath = resolve(import.meta.dir, '../../.copilot_tokens.json');
+import { setting } from '../lib/config.mjs';
 const _defaultModel = 'claude-sonnet-5';
 
 const _config = {
-  github: {
-    device_code_url: 'https://github.com/login/device/code',
-    access_token_url: 'https://github.com/login/oauth/access_token',
-    client_id: 'Iv1.b507a08c87ecfe98',
-    user_agent: 'GitHubCopilot/1.155.0',
-  },
   copilot: {
-    token_url: 'https://api.github.com/copilot_internal/v2/token',
     default_api_url: 'https://api.githubcopilot.com',
     editor_version: 'vscode/1.85.1',
     editor_plugin_version: 'copilot/1.155.0',
@@ -25,151 +14,28 @@ const _config = {
 
 let _tokens = null;
 
-// --- token persistence ---
-
-async function _loadTokens() {
-  try {
-    return JSON.parse(await readFile(_tokensPath, 'utf-8'));
-  } catch {
-    return null;
+async function environmentSession() {
+  const githubToken = process.env.AGL_COPILOT_GITHUB_TOKEN;
+  const copilotToken = process.env.AGL_COPILOT_TOKEN;
+  const expiresAt = Number(process.env.AGL_COPILOT_EXPIRES_AT);
+  if (!githubToken || !copilotToken || !expiresAt) {
+    throw new Error('AGL_COPILOT_GITHUB_TOKEN, AGL_COPILOT_TOKEN, and AGL_COPILOT_EXPIRES_AT are required; run `tokenman refresh agl-copilot` and launch through `op run`.');
   }
-}
-
-async function _saveTokens(tokens) {
-  await mkdir(dirname(_tokensPath), { recursive: true });
-  await writeFile(_tokensPath, JSON.stringify(tokens, null, 2));
-}
-
-// --- github device-flow auth ---
-
-async function _startDeviceFlow() {
-  const res = await fetch(_config.github.device_code_url, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': _config.github.user_agent,
-    },
-    body: JSON.stringify({
-      client_id: _config.github.client_id,
-      scope: 'read:user',
-    }),
-  });
-  if (!res.ok) throw new Error(`Device flow failed: ${res.statusText}`);
-  return await res.json();
-}
-
-async function _pollForAccessToken(deviceCode, interval) {
-  const deadline = Date.now() + 15 * 60 * 1000;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, interval * 1000));
-    const res = await fetch(_config.github.access_token_url, {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'User-Agent': _config.github.user_agent,
-      },
-      body: JSON.stringify({
-        client_id: _config.github.client_id,
-        device_code: deviceCode,
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      }),
-    });
-    const data = await res.json();
-    if (data.access_token) return data.access_token;
-    if (data.error === 'authorization_pending') continue;
-    throw new Error(`Auth failed: ${data.error_description || data.error}`);
+  if (expiresAt * 1000 <= Date.now()) {
+    throw new Error('AGL Copilot token is expired; run `tokenman refresh agl-copilot` and relaunch.');
   }
-  throw new Error('Authentication timed out');
-}
-
-async function _getCopilotToken(githubToken) {
-  const res = await fetch(_config.copilot.token_url, {
-    headers: {
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${githubToken}`,
-      'User-Agent': _config.copilot.user_agent,
-      'Editor-Version': _config.copilot.editor_version,
-      'Editor-Plugin-Version': _config.copilot.editor_plugin_version,
-    },
-  });
-  if (!res.ok) throw new Error(`Failed to get Copilot token: ${res.statusText}`);
-  return await res.json();
-}
-
-async function _authenticate() {
-  const flow = await _startDeviceFlow();
-  console.log(`\nVisit: ${flow.verification_uri}`);
-  console.log(`Enter code: ${flow.user_code}\n`);
-  const githubToken = await _pollForAccessToken(flow.device_code, flow.interval);
-  console.log('GitHub authenticated.');
-
-  const copilotData = await _getCopilotToken(githubToken);
-  console.log('Copilot token obtained.');
-
-  const tokens = {
+  return {
     github_token: githubToken,
-    copilot_token: copilotData.token,
-    expires_at: copilotData.expires_at,
-    api_url: copilotData.endpoints?.api || _config.copilot.default_api_url,
+    copilot_token: copilotToken,
+    expires_at: expiresAt,
+    api_url: await setting('copilot_api_url', _config.copilot.default_api_url),
   };
-  await _saveTokens(tokens);
-  return tokens;
-}
-
-// --- session: load / refresh / auth ---
-
-// Deduplicate concurrent session refreshes. When many Agent.factory()/init()
-// calls run in parallel (e.g. a parallelized batch), they would otherwise each
-// see the same expired token and each hit the refresh endpoint. Instead, the
-// first caller starts the refresh and stores its promise here; everyone else
-// awaits the same promise and reuses the freshly-minted token.
-let _sessionPromise = null;
-
-async function _getSession({ force = false } = {}) {
-  // A valid cached token needs no coordination — return it immediately.
-  if (!force && _tokens?.copilot_token && _tokens.expires_at * 1000 > Date.now()) {
-    return _tokens;
-  }
-  if (_sessionPromise) return _sessionPromise;
-  _sessionPromise = _refreshSession({ force }).finally(() => {
-    _sessionPromise = null;
-  });
-  return _sessionPromise;
-}
-
-async function _refreshSession({ force = false } = {}) {
-  let tokens = await _loadTokens();
-
-  // valid copilot token (another process may have just refreshed it on disk)
-  if (!force && tokens?.copilot_token && tokens.expires_at * 1000 > Date.now()) {
-    return tokens;
-  }
-
-  // refresh with existing github token
-  if (tokens?.github_token) {
-    console.debug('Refreshing Copilot token...');
-    try {
-      const data = await _getCopilotToken(tokens.github_token);
-      tokens.copilot_token = data.token;
-      tokens.expires_at = data.expires_at;
-      tokens.api_url = data.endpoints?.api || _config.copilot.default_api_url;
-      await _saveTokens(tokens);
-      return tokens;
-    } catch {
-      console.warn('Cached GitHub token invalid, re-authenticating.');
-    }
-  }
-
-  // fresh device-flow auth
-  return await _authenticate();
 }
 
 // --- public interface ---
 
 export async function init() {
-  _tokens = await _getSession();
+  _tokens = await environmentSession();
 }
 
 async function _request({ method, uri, body, extraHeaders, signal }) {
@@ -196,9 +62,7 @@ async function _request({ method, uri, body, extraHeaders, signal }) {
   // agent provider-invocation loop (applies to all providers), not here.
   const res = await fetch(url, opts);
   if (res.status === 401) {
-    console.warn('Copilot token expired, refreshing...');
-    _tokens = await _getSession({ force: true });
-    return _request({ method, uri, body, extraHeaders });
+    throw new Error('Copilot authentication was rejected; run `tokenman refresh agl-copilot` and relaunch.');
   }
 
   if (res.ok) {

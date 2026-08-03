@@ -1,34 +1,27 @@
 import { readFile } from 'fs/promises';
 import { resolve } from 'path';
 
-let dotenvCache = null;
+let settingsCache = null;
 
-async function _parseDotenv() {
-  if (dotenvCache !== null) return dotenvCache;
-  dotenvCache = {};
+async function settings() {
+  if (settingsCache !== null) return settingsCache;
+  settingsCache = {};
   try {
-    const content = await readFile(resolve(import.meta.dir ?? '.', '../../.env'), 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const idx = trimmed.indexOf('=');
-      if (idx === -1) continue;
-      const key = trimmed.slice(0, idx).trim();
-      let val = trimmed.slice(idx + 1).trim();
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.slice(1, -1);
-      }
-      dotenvCache[key] = val;
+    const text = await readFile(resolve(import.meta.dir ?? '.', '../../config.yaml'), 'utf8');
+    for (const line of text.split('\n')) {
+      const match = line.match(/^\s*([\w.-]+)\s*:\s*(.*?)\s*$/);
+      if (match) settingsCache[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
     }
   } catch {
-    // .env file not found or unreadable
+    // AGL has safe defaults for all non-secret configuration.
   }
-  return dotenvCache;
+  return settingsCache;
 }
 
 export async function read(var_name) {
-  if (var_name in process.env) return process.env[var_name];
-  const env = await _parseDotenv();
-  if (var_name in env) return env[var_name];
-  return null;
+  return process.env[var_name] || null;
+}
+
+export async function setting(name, fallback = null) {
+  return (await settings())[name] || fallback;
 }

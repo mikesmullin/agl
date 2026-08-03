@@ -1,0 +1,2 @@
+# Non-secret AGL provider constants. Credentials are supplied by Tokenman via op run.
+copilot_api_url: https://api.githubcopilot.com

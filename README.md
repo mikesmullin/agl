@@ -59,14 +59,20 @@ These are supported.
 | Provider | Model format | Auth |
 |----------|-------------|------|
 | xAI | `xai:<model>` | `XAI_API_KEY` env var |
-| Copilot | `copilot:<model>` | GitHub device-flow OAuth |
+| Copilot | `copilot:<model>` | Tokenman-injected Copilot session |
 | Ollama | `ollama:<model>` | None (localhost) |
 | LM Studio | `lm-studio:<model>` | None (localhost) |
 | RunPod | `runpod:<model>` | `RUNPOD_BASE_URL` (OpenAI-compatible pod proxy/tunnel) |
 
-Creating an `.env` file in the project root with your provider API key(s) is also supported.
+Credentials are supplied through the process environment. With Tokenman:
 
-For GitHub Copilot, run once and follow the device-flow auth prompt — tokens are cached automatically.
+```sh
+op run --env-file=<(tokenman script agl-xai) -- bun src/agents/home.mjs 'hello'
+op run --env-file=<(tokenman script agl-copilot) -- bun src/agents/home.mjs 'hello'
+```
+
+Tokenman owns provider refresh and any required interactive login; AGL does not
+read `.env` or persist provider tokens.
 
 ## Running
 
