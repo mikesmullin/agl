@@ -4,6 +4,7 @@ import * as copilot from './providers/copilot.mjs';
 import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
 import * as runpod from './providers/runpod.mjs';
+import * as muse from './providers/muse.mjs';
 
 const PROVIDERS = {
   xai,
@@ -11,6 +12,7 @@ const PROVIDERS = {
   ollama,
   'lm-studio': lmstudio,
   runpod,
+  muse,
 };
 
 /**

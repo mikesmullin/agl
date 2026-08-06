@@ -10,7 +10,8 @@
     "./providers/copilot": "./src/providers/copilot.mjs",
     "./providers/runpod": "./src/providers/runpod.mjs",
     "./providers/ollama": "./src/providers/ollama.mjs",
-    "./providers/lm-studio": "./src/providers/lm-studio.mjs"
+    "./providers/lm-studio": "./src/providers/lm-studio.mjs",
+    "./providers/muse": "./src/providers/muse.mjs"
   },
   "files": [
     "src/agent.mjs",

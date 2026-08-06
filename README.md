@@ -63,6 +63,7 @@ These are supported.
 | Ollama | `ollama:<model>` | None (localhost) |
 | LM Studio | `lm-studio:<model>` | None (localhost) |
 | RunPod | `runpod:<model>` | `RUNPOD_BASE_URL` (OpenAI-compatible pod proxy/tunnel) |
+| Muse | `muse:<model>` | `MUSE_API_KEY` env var |
 
 Credentials are supplied through the process environment. With Tokenman:
 
