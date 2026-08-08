@@ -1,6 +1,6 @@
 {
   "name": "agl-ai",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "Minimalist Pydantic AI clone in Bun JavaScript.",
   "type": "module",
   "main": "src/agent.mjs",

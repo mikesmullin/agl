@@ -47,7 +47,14 @@ async function _request({ method, uri, body, signal }) {
     uri,
     body: body !== undefined && method?.toUpperCase() !== 'GET' ? body : undefined,
   });
-  const response = await fetch(`${_baseUrl}${uri}`, opts);
+  let response;
+  try {
+    response = await fetch(`${_baseUrl}${uri}`, opts);
+  } catch (err) {
+    const url = `${_baseUrl}${uri}`;
+    const cause = err?.cause ? ` (${String(err.cause).slice(0, 200)})` : '';
+    throw new Error(`Unable to connect to LM Studio at ${url}: ${err?.message || err}${cause}. Is LM Studio running? Check LM_STUDIO_BASE_URL (default http://127.0.0.1:1234) and that the model is loaded.`);
+  }
   if (response.ok) {
     return response;
   }
