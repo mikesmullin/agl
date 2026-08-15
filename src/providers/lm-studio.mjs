@@ -1,7 +1,7 @@
 import { debug } from '../lib/debug.mjs';
 import * as config from '../lib/config.mjs';
 
-const _defaultModel = 'google/gemma-4-e4b';
+const _defaultModel = 'google/gemma-4-12b-qat';
 
 let _baseUrl = '';
 

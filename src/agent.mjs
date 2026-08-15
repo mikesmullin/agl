@@ -360,7 +360,7 @@ function _toProviderMessage(m) {
 
 export default class Agent {
   static default = {
-    model: 'copilot:gpt-5.6-luna',
+    model: 'lm-studio:google/gemma-4-12b-qat',
     /** @deprecated use context_window_size — kept for factory back-compat (number) */
     context_window: null,
     context_window_size: null,
@@ -372,6 +372,12 @@ export default class Agent {
     // Max simultaneous in-flight Agent.run() calls (provider inference loops).
     // Default 1 (serial). Set higher (e.g. 6) to parallelize.
     concurrency: 1,
+    /**
+     * Max provider inference rounds per Agent.run() when an output_tool is set.
+     * Each model call (including after tool results / after nudges) counts as one turn.
+     * Override per agent via Agent.factory({ max_turns }).
+     */
+    max_turns: 5,
   };
 
   // tool registry
@@ -406,6 +412,251 @@ export default class Agent {
     return tools;
   }
 
+  /** OpenAI-style signature text for the registered output tool (for nudges). */
+  _outputToolSignature() {
+    const name = this.output_tool_name;
+    if (!name || !this.tools[name]) {
+      return `${name || 'final_result'}(…unknown schema…)`;
+    }
+    const fn = this.tools[name];
+    const props = fn._properties || {};
+    const required = new Set(fn._required || []);
+    const params = Object.keys(props).map((k) => {
+      const p = props[k] || {};
+      const t = p.type || 'any';
+      const req = required.has(k) ? '' : '?';
+      return `${k}${req}: ${t}`;
+    });
+    const desc = (fn._description || '').trim();
+    const sig = `${name}({ ${params.join(', ')} })`;
+    return desc ? `${sig}\n  // ${desc}` : sig;
+  }
+
+  /**
+   * Assess a failed assistant turn that did not call the output tool.
+   * @returns {{ expected: string[], observed: string[], summary: string }}
+   */
+  _assessMissingOutputTool(assistantMsg) {
+    const name = this.output_tool_name || 'final_result';
+    const content =
+      assistantMsg?.content != null ? String(assistantMsg.content) : '';
+    const finish = assistantMsg?.finish_reason; // usually on choice, not message
+    const hasContent = content.trim().length > 0;
+    const hasTc =
+      Array.isArray(assistantMsg?.tool_calls) &&
+      assistantMsg.tool_calls.length > 0;
+    const expected = [
+      `Exactly one tool call to \`${name}\` (the registered output tool)`,
+      'No freeform-only answer — the user ignores assistant prose as the final answer',
+      `Arguments matching the output tool schema: ${this._outputToolSignature()}`,
+    ];
+    const observed = [];
+    if (!hasTc) {
+      observed.push('No tool_calls on the assistant message (empty / missing)');
+    } else {
+      const names = assistantMsg.tool_calls
+        .map((c) => c?.function?.name || '(unnamed)')
+        .join(', ');
+      observed.push(`tool_calls present but not treated as output completion: ${names}`);
+    }
+    if (hasContent) {
+      const preview = content.replace(/\s+/g, ' ').trim().slice(0, 280);
+      observed.push(
+        `Freeform assistant content was returned (${content.trim().length} chars): "${preview}${content.trim().length > 280 ? '…' : ''}"`,
+      );
+    } else {
+      observed.push('Assistant content empty or null (and no usable output tool call)');
+    }
+    if (finish) observed.push(`finish_reason=${finish}`);
+    const summary = hasContent
+      ? 'Model produced prose (or empty tool payload) instead of invoking the required output tool.'
+      : 'Model stopped without invoking the required output tool.';
+    return { expected, observed, summary };
+  }
+
+  /**
+   * Build a user-role nudge after the model failed to call the output tool.
+   * @param {{
+   *   failedAttempts: number,
+   *   remainingTurns: number,
+   *   maxTurns: number,
+   *   assistantMsg: object|null,
+   *   finishReason?: string|null,
+   *   judgeFeedback?: string|null,
+   * }} opts
+   */
+  _buildOutputToolNudge(opts = {}) {
+    const name = this.output_tool_name || 'final_result';
+    const failedAttempts = Number(opts.failedAttempts) || 1;
+    const remainingTurns = Math.max(0, Number(opts.remainingTurns) || 0);
+    const maxTurns = Number(opts.maxTurns) || this.max_turns || 5;
+    const assistantMsg = opts.assistantMsg || null;
+    if (assistantMsg && opts.finishReason && !assistantMsg.finish_reason) {
+      assistantMsg.finish_reason = opts.finishReason;
+    }
+    const sig = this._outputToolSignature();
+    const assessment = this._assessMissingOutputTool(assistantMsg);
+
+    const lines = [];
+    lines.push('═══ PROTOCOL VIOLATION — OUTPUT TOOL REQUIRED ═══');
+    lines.push('');
+    lines.push('FACTS (non-negotiable):');
+    lines.push(
+      '1. The user will NOT accept any outcome other than a tool call to the output tool.',
+    );
+    lines.push(
+      '2. The user will NOT read (and will discard) any assistant freeform text as the final answer — prose alone is a failed turn.',
+    );
+    lines.push(
+      `3. To succeed and satisfy the user you MUST call the output tool named \`${name}\`. That is the only successful terminal action.`,
+    );
+    lines.push('');
+    lines.push('REQUIRED TOOL — name and signature:');
+    lines.push(`  name: ${name}`);
+    lines.push(`  signature: ${sig}`);
+    lines.push('');
+
+    if (failedAttempts <= 1) {
+      lines.push(
+        'Your previous response did not call this tool. Call it now with a complete argument object.',
+      );
+    } else {
+      lines.push('ASSESSMENT OF YOUR LAST FAILED RESPONSE:');
+      lines.push(`  Summary: ${assessment.summary}`);
+      lines.push('  Expected:');
+      for (const e of assessment.expected) lines.push(`    ✓ ${e}`);
+      lines.push('  Observed:');
+      for (const o of assessment.observed) lines.push(`    ✗ ${o}`);
+      lines.push('');
+      lines.push(
+        `Failed attempts so far: ${failedAttempts}. Turns remaining (including your next reply): ${remainingTurns} of max ${maxTurns}.`,
+      );
+      lines.push(
+        'Do NOT repeat the same mistake (freeform answer, wrong tool name, or empty tool_calls).',
+      );
+      lines.push(
+        'Think carefully before your next action. Prefer high-reasoning: plan the exact tool call, then emit only that tool call.',
+      );
+      lines.push(
+        'WARNING: If you exhaust remaining turns without a successful call to the output tool, this run will be ABORTED and scored as a FAILURE.',
+      );
+    }
+
+    if (opts.judgeFeedback && String(opts.judgeFeedback).trim()) {
+      lines.push('');
+      lines.push('═══ LAST-CHANCE JUDGE FEEDBACK (one turn remaining) ═══');
+      lines.push(String(opts.judgeFeedback).trim());
+      lines.push('');
+      lines.push(
+        `This is your FINAL opportunity. Call \`${name}\` now with correct arguments. Freeform text will fail the run.`,
+      );
+    }
+
+    lines.push('');
+    lines.push(
+      `NEXT ACTION: Invoke tool \`${name}\` exactly once with all required parameters filled.`,
+    );
+    return lines.join('\n');
+  }
+
+  /**
+   * LLM-as-judge microagent for last-chance recovery feedback.
+   * Freeform (no output_tool) so it cannot recurse into the same nudge loop.
+   * @returns {Promise<string>}
+   */
+  async _judgeMissingOutputTool({
+    assistantMsg,
+    failedAttempts,
+    maxTurns,
+    remainingTurns,
+    finishReason,
+  }) {
+    const name = this.output_tool_name || 'final_result';
+    const sig = this._outputToolSignature();
+    const assessment = this._assessMissingOutputTool({
+      ...(assistantMsg || {}),
+      finish_reason: finishReason || assistantMsg?.finish_reason,
+    });
+    const lastContent =
+      assistantMsg?.content != null ? String(assistantMsg.content) : '';
+    const lastTc = Array.isArray(assistantMsg?.tool_calls)
+      ? JSON.stringify(assistantMsg.tool_calls).slice(0, 2000)
+      : '(none)';
+
+    const modelSpec = `${this.provider}:${this.model}`;
+    let feedback = '';
+    try {
+      const judge = await Agent.factory({
+        model: modelSpec,
+        // No output_tool — single freeform completion; max_turns unused for freeform stop
+        max_turns: 1,
+        retain_history: false,
+        retries: 0,
+        system_prompt: `You are a strict protocol judge for a tool-calling agent.
+Your job is NOT to answer the original user task. You only diagnose why the agent failed
+to call its required output tool, and coach the next (final) attempt.
+
+Write concise, high-signal coaching for the failing agent:
+- Describe the failure clearly
+- Describe the desired behavior
+- Give one concrete example of a correct tool invocation (name + JSON arguments shape)
+Do not call tools yourself. Plain text only.`,
+      });
+      const result = await judge.run({
+        prompt: `<task>
+Diagnose the agent's failed turn and write recovery coaching for its LAST remaining attempt.
+</task>
+
+<required-output-tool>
+name: ${name}
+signature:
+${sig}
+</required-output-tool>
+
+<budget>
+failed_attempts: ${failedAttempts}
+max_turns: ${maxTurns}
+remaining_turns: ${remainingTurns}
+</budget>
+
+<assessment>
+summary: ${assessment.summary}
+expected:
+${assessment.expected.map((e) => `- ${e}`).join('\n')}
+observed:
+${assessment.observed.map((o) => `- ${o}`).join('\n')}
+</assessment>
+
+<last-assistant-content>
+${lastContent.slice(0, 4000) || '(empty)'}
+</last-assistant-content>
+
+<last-assistant-tool-calls>
+${lastTc}
+</last-assistant-tool-calls>
+
+Respond with:
+1) Failure description
+2) Desired behavior
+3) Example tool call for \`${name}\` (illustrative JSON args)
+`,
+      });
+      feedback =
+        Agent.lastAssistantResponse(result) ||
+        (typeof result === 'string' ? result : '') ||
+        '';
+    } catch (err) {
+      debug('Agent output-tool judge failed.', err);
+      feedback = [
+        'Judge unavailable; static recovery brief:',
+        assessment.summary,
+        `You must call \`${name}\` with schema: ${sig}`,
+        'Do not answer in prose. Emit only the required tool call.',
+      ].join('\n');
+    }
+    return String(feedback || '').trim();
+  }
+
   static async factory({
     model,
     system_prompt,
@@ -419,6 +670,9 @@ export default class Agent {
     stream,
     on_delta,
     retain_history,
+    // Max provider inference rounds per run (default Agent.default.max_turns = 5).
+    // Applies especially when output_tool is set: prevents infinite nudge loops.
+    max_turns,
     // Number of *re*-tries after the first failure (0 = try once, never retry).
     // Honored centrally by withProviderRetry for every provider. Prefer this
     // over AGL_RETRY_ATTEMPTS when a caller (e.g. brain viz) needs cancel to
@@ -432,6 +686,15 @@ export default class Agent {
       inst.retry_attempts = Math.max(1, Math.floor(Number(retries)) + 1);
     } else {
       inst.retry_attempts = null; // fall through to env / default
+    }
+
+    {
+      const mt =
+        max_turns != null
+          ? Number(max_turns)
+          : Number(Agent.default.max_turns ?? 5);
+      inst.max_turns =
+        Number.isFinite(mt) && mt >= 1 ? Math.floor(mt) : 5;
     }
 
     // Token budget (was historically named context_window as a number).
@@ -740,7 +1003,12 @@ export default class Agent {
     const providerMessages = () =>
       retain ? this.messagesForProvider() : oneshot;
 
+    const maxTurns = Math.max(1, Number(this.max_turns) || 5);
     let done = false;
+    let turnsUsed = 0;
+    /** Times the model ended a turn without calling the required output tool. */
+    let outputToolFailures = 0;
+
     while (true) {
       if (this.aborted) {
         throw new Error(this._abortReason || 'agent aborted');
@@ -748,6 +1016,17 @@ export default class Agent {
       if (done) {
         return this.last_output;
       }
+
+      // Cap provider rounds (inference calls) to stop infinite nudge loops.
+      if (turnsUsed >= maxTurns) {
+        const name = this.output_tool_name || 'final_result';
+        throw new Error(
+          `agent exceeded max_turns=${maxTurns} without a successful ` +
+            `output tool call (\`${name}\`); aborting as failure ` +
+            `(output_tool_failures=${outputToolFailures})`,
+        );
+      }
+      turnsUsed += 1;
 
       const messages = providerMessages();
 
@@ -834,21 +1113,6 @@ export default class Agent {
         }
       }
 
-      // common response shape:
-      // result.id
-      // result.created
-      // result.model
-      // result.choices[].message.role
-      // result.choices[].message.content
-      // result.choices[].finish_reason
-      // result.usage.prompt_tokens
-      // result.usage.completion_tokens
-      // result.usage.prompt_tokens_details.cached_tokens
-      // result.usage.total_tokens
-
-      // Reasoning is pushed onto context_window by the harness (angela) when it
-      // logs the provider response — keeps 1 jsonl event = 1 context item.
-
       // Collect choices that include tool calls. Some gateways (LM Studio /
       // Gemma) set finish_reason to "length" or "stop" while still returning
       // message.tool_calls — treat any non-empty tool_calls as a tool turn.
@@ -859,8 +1123,11 @@ export default class Agent {
 
       if (toolCallChoices.length === 0) {
         if (this.output_tool_name && !done) {
-          // model stopped without calling the output tool — nudge it
-          const assistantMsg = result.choices?.[0]?.message;
+          // Model stopped without calling the output tool — bounded nudge loop.
+          outputToolFailures += 1;
+          const choice0 = result.choices?.[0];
+          const assistantMsg = choice0?.message || null;
+          const finishReason = choice0?.finish_reason ?? null;
           if (assistantMsg) {
             if (retain) {
               this.pushContext({
@@ -874,13 +1141,51 @@ export default class Agent {
               oneshot.push(assistantMsg);
             }
           }
+
+          const remainingTurns = maxTurns - turnsUsed;
+          if (remainingTurns <= 0) {
+            throw new Error(
+              `agent failed to call output tool \`${this.output_tool_name}\` ` +
+                `within max_turns=${maxTurns} ` +
+                `(output_tool_failures=${outputToolFailures})`,
+            );
+          }
+
+          let judgeFeedback = null;
+          // One turn remaining → LLM-as-judge coaches the final recovery attempt.
+          if (remainingTurns === 1) {
+            debug('Agent invoking output-tool judge (last turn).', {
+              outputToolFailures,
+              maxTurns,
+            });
+            judgeFeedback = await this._judgeMissingOutputTool({
+              assistantMsg,
+              failedAttempts: outputToolFailures,
+              maxTurns,
+              remainingTurns,
+              finishReason,
+            });
+          }
+
           const nudge = {
             role: 'user',
-            content: `(To encourage structured output), we expect your final response to be given via tool call; Please use \`${this.output_tool_name}\` tool.`,
+            content: this._buildOutputToolNudge({
+              failedAttempts: outputToolFailures,
+              remainingTurns,
+              maxTurns,
+              assistantMsg,
+              finishReason,
+              judgeFeedback,
+            }),
           };
           if (retain) this.pushContext(nudge);
           else oneshot.push(nudge);
-          debug('Agent nudging model to call output tool.', this.output_tool_name);
+          debug('Agent nudging model to call output tool.', {
+            tool: this.output_tool_name,
+            outputToolFailures,
+            remainingTurns,
+            hasJudge: Boolean(judgeFeedback),
+          });
           continue;
         }
         // Freeform completion: retain assistant (reasoning already pushed above).
@@ -942,7 +1247,13 @@ export default class Agent {
           return {
             call,
             args,
-            content: JSON.stringify({ error: `unknown tool: ${name}` }),
+            content: JSON.stringify({
+              error: `unknown tool: ${name}`,
+              hint: this.output_tool_name
+                ? `Registered tools: ${Object.keys(this.tools).join(', ')}. ` +
+                  `To finish you must call \`${this.output_tool_name}\`.`
+                : `Registered tools: ${Object.keys(this.tools).join(', ')}.`,
+            }),
           };
         }
         try {
