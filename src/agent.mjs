@@ -5,6 +5,7 @@ import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
 import * as runpod from './providers/runpod.mjs';
 import * as muse from './providers/muse.mjs';
+import * as mycloud from './providers/mycloud.mjs';
 
 const PROVIDERS = {
   xai,
@@ -13,6 +14,8 @@ const PROVIDERS = {
   'lm-studio': lmstudio,
   runpod,
   muse,
+  mycloud,
+  'llama-server': mycloud,
 };
 
 /**
@@ -667,6 +670,8 @@ Respond with:
     parallel_tools,
     reasoning_effort,
     max_tokens,
+    temperature,
+    chat_template_kwargs,
     stream,
     on_delta,
     retain_history,
@@ -678,6 +683,14 @@ Respond with:
     // over AGL_RETRY_ATTEMPTS when a caller (e.g. brain viz) needs cancel to
     // stick and must not re-fire a stuck inference loop.
     retries,
+    // Per-attempt wall-clock timeout (ms). Overrides AGL_TIMEOUT_MS for this agent.
+    timeout_ms,
+    // Per-agent provider endpoint / credential overrides (mycloud / llama-server).
+    // Needed when talking to a just-provisioned instance whose IP/key are not
+    // the process-wide MYCLOUD_BASE_URL / MYCLOUD_API_KEY.
+    base_url,
+    api_key,
+    ca_file,
   } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
@@ -732,6 +745,12 @@ Respond with:
     inst.parallel_tools = parallel_tools ?? false;
     inst.reasoning_effort = reasoning_effort ?? Agent.default.reasoning_effort ?? null;
     inst.max_tokens = max_tokens ?? null;
+    inst.temperature = temperature ?? null;
+    inst.chat_template_kwargs = chat_template_kwargs ?? null;
+    inst.timeout_ms = timeout_ms ?? null;
+    inst.base_url = base_url ?? null;
+    inst.api_key = api_key ?? null;
+    inst.ca_file = ca_file ?? null;
     inst.stream = stream ?? false;
     inst.on_delta = on_delta ?? null;
     // When true, run() appends user/assistant/tool turns onto context_window
@@ -758,7 +777,11 @@ Respond with:
     }
     inst.system_prompt = system_prompt;
     inst.tool_choice = tool_choice;
-    await inst.client.init();
+    await inst.client.init({
+      base_url: inst.base_url,
+      api_key: inst.api_key,
+      ca_file: inst.ca_file,
+    });
 
     const wideModelSpec = Agent.default.WIDE_MODEL;
     if (wideModelSpec) {
@@ -767,7 +790,11 @@ Respond with:
       inst._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
       inst._wideClient = wideProvider ? PROVIDERS[wideProvider] : inst.client;
       if (inst._wideClient && inst._wideClient !== inst.client) {
-        await inst._wideClient.init();
+        await inst._wideClient.init({
+          base_url: inst.base_url,
+          api_key: inst.api_key,
+          ca_file: inst.ca_file,
+        });
       }
     }
 
@@ -1053,6 +1080,11 @@ Respond with:
         req.context_window = this.context_window_size;
       }
       if (this.max_tokens) req.max_tokens = this.max_tokens;
+      if (this.temperature != null) req.temperature = this.temperature;
+      if (this.chat_template_kwargs) req.chat_template_kwargs = this.chat_template_kwargs;
+      if (this.base_url) req.base_url = this.base_url;
+      if (this.api_key) req.api_key = this.api_key;
+      if (this.ca_file) req.ca_file = this.ca_file;
       if (this.stream) req.stream = this.stream;
       if (this.stream && this.on_delta) req.on_delta = this.on_delta;
       // Client-side abort of the HTTP stream (Stop / new prompt interrupt)
@@ -1076,6 +1108,7 @@ Respond with:
           }),
           {
             ...(this.stream ? { timeoutMs: 0 } : {}),
+            ...(this.timeout_ms != null ? { timeoutMs: this.timeout_ms } : {}),
             signal: runSignal,
             ...(this.retry_attempts != null ? { attempts: this.retry_attempts } : {}),
           },

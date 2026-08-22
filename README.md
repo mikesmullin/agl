@@ -30,6 +30,16 @@ const agent = await Agent.factory({
 });
 const result = await agent.run({ prompt: 'What is 2+2?' });
 
+// mycloud / llama-server — pass this instance's URL + API key (do not rely on
+// process-wide MYCLOUD_BASE_URL, which may still point at a previous VM)
+const llama = await Agent.factory({
+  model: 'mycloud:qwen-3.8-27b',
+  base_url: 'https://HOST:1234',
+  api_key: instanceApiKey,
+  ca_file: process.env.MYCLOUD_CA_FILE, // optional; default ~/.mycloud/cert.pem
+});
+await llama.run({ prompt: '2+2?' });
+
 // Tool calling
 const agent = await Agent.factory({
   model: 'xai:grok-4-1-fast-reasoning',
@@ -64,6 +74,7 @@ These are supported.
 | Ollama | `ollama:<model>` | None (localhost) |
 | LM Studio | `lm-studio:<model>` | None (localhost) |
 | RunPod | `runpod:<model>` | `RUNPOD_BASE_URL` (OpenAI-compatible pod proxy/tunnel) |
+| mycloud / llama-server | `mycloud:<model>` or `llama-server:<model>` | `MYCLOUD_BASE_URL` + `MYCLOUD_API_KEY` (HTTPS llama.cpp, e.g. GCE `:1234`). Optional `MYCLOUD_CA_FILE` for a self-signed cert (default `~/.mycloud/cert.pem`). Override per agent with `Agent.factory({ base_url, api_key, ca_file })`. |
 | Muse | `muse:<model>` | `MUSE_API_KEY` env var |
 
 Credentials are supplied through the process environment. With Tokenman:
