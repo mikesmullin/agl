@@ -189,6 +189,7 @@ export async function inference({
   top_k,
   stream = false,
   chat_template_kwargs,
+  reasoning_effort,
   on_delta,
   signal,
   base_url,
@@ -216,6 +217,7 @@ export async function inference({
   if (chat_template_kwargs && typeof chat_template_kwargs === 'object') {
     body.chat_template_kwargs = chat_template_kwargs;
   }
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort;
 
   if (!stream) {
     const response = await _request({

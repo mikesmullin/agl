@@ -191,10 +191,12 @@ export async function inference({
   stream,
   on_delta,
   max_tokens,
+  reasoning_effort,
   signal,
 }) {
   const body = { model, messages, tools, tool_choice };
   if (max_tokens) body.max_tokens = max_tokens;
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort;
 
   if (!stream) {
     const response = await _request({

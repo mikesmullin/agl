@@ -37,7 +37,7 @@ export async function models() {
 }
 
 // request a completion (openai-compatible)
-export async function inference({ model = _defaultModel, messages, tools }) {
+export async function inference({ model = _defaultModel, messages, tools, reasoning_effort }) {
   // ollama expects tool_call arguments as objects, not JSON strings
   const _messages = messages.map(m => {
     if (!m.tool_calls) return m;
@@ -57,6 +57,7 @@ export async function inference({ model = _defaultModel, messages, tools }) {
 
   const body = { model, messages: _messages, stream: false };
   if (tools?.length) body.tools = tools;
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort;
   const response = await _request({ method: 'POST', uri: '/api/chat', body });
   const data = await response.json();
 

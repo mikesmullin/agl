@@ -27,6 +27,7 @@ import Agent from 'agl-ai';
 const agent = await Agent.factory({
   model: 'xai:grok-4-1-fast-reasoning',
   system_prompt: 'You are a helpful assistant.',
+  reasoning_effort: 'high', // optional; omitted/blank → provider default
 });
 const result = await agent.run({ prompt: 'What is 2+2?' });
 

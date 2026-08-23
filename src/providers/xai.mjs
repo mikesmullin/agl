@@ -73,7 +73,7 @@ export async function models() {
 
 /**
  * Chat completion (OpenAI-compatible).
- * @param {{ model?: string, messages: object[], tools?: object[], tool_choice?: any, max_tokens?: number }} opts
+ * @param {{ model?: string, messages: object[], tools?: object[], tool_choice?: any, max_tokens?: number, reasoning_effort?: string }} opts
  */
 export async function inference({
   model = _defaultModel,
@@ -81,6 +81,7 @@ export async function inference({
   tools,
   tool_choice,
   max_tokens,
+  reasoning_effort,
 } = {}) {
   const body = {
     model: model || _defaultModel,
@@ -89,6 +90,7 @@ export async function inference({
   if (tools?.length) body.tools = tools;
   if (tool_choice !== undefined) body.tool_choice = tool_choice;
   if (max_tokens != null) body.max_tokens = max_tokens;
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort;
 
   const response = await _request({
     method: 'POST',

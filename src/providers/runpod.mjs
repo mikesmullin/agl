@@ -104,6 +104,7 @@ export async function models() {
  *   top_k?: number,
  *   stream?: boolean,
  *   chat_template_kwargs?: object,
+ *   reasoning_effort?: string,
  * }} opts
  */
 export async function inference({
@@ -117,6 +118,7 @@ export async function inference({
   top_k,
   stream = false,
   chat_template_kwargs,
+  reasoning_effort,
 } = {}) {
   const resolved =
     model ||
@@ -141,6 +143,7 @@ export async function inference({
   if (chat_template_kwargs && typeof chat_template_kwargs === 'object') {
     body.chat_template_kwargs = chat_template_kwargs;
   }
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort;
 
   const response = await _request({
     method: 'POST',

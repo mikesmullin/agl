@@ -82,6 +82,7 @@ export async function inference({
   tools,
   tool_choice,
   max_tokens,
+  reasoning_effort,
   signal,
 } = {}) {
   const body = { model: model || _defaultModel, messages };
@@ -97,6 +98,7 @@ export async function inference({
     body.tool_choice = tc;
   }
   if (max_tokens != null) body.max_tokens = max_tokens;
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort;
   const response = await _request({ method: 'POST', uri: '/v1/chat/completions', body, signal });
   return await response.json();
 }

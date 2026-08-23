@@ -369,6 +369,7 @@ export default class Agent {
     context_window_size: null,
     MAX_CTX_LEN: null,
     WIDE_MODEL: null,
+    /** OpenAI-style effort (low|medium|high|xhigh|…). Blank/omitted → omit from request. */
     reasoning_effort: null,
     // Default "provider:model" spec for Agent.embed() when none is passed.
     embed_model: null,
@@ -668,6 +669,7 @@ Respond with:
     context_window, // legacy: number (max tokens) OR array (seed messages)
     context_window_size,
     parallel_tools,
+    // OpenAI-style effort string (low|medium|high|xhigh|…). Blank/omitted → omit.
     reasoning_effort,
     max_tokens,
     temperature,
@@ -743,7 +745,15 @@ Respond with:
     }
 
     inst.parallel_tools = parallel_tools ?? false;
-    inst.reasoning_effort = reasoning_effort ?? Agent.default.reasoning_effort ?? null;
+    {
+      const trimmed =
+        reasoning_effort == null ? '' : String(reasoning_effort).trim();
+      const fromDefault =
+        Agent.default.reasoning_effort == null
+          ? ''
+          : String(Agent.default.reasoning_effort).trim();
+      inst.reasoning_effort = trimmed || fromDefault || null;
+    }
     inst.max_tokens = max_tokens ?? null;
     inst.temperature = temperature ?? null;
     inst.chat_template_kwargs = chat_template_kwargs ?? null;
