@@ -14,7 +14,8 @@ const agent = await Agent.factory({
   system_prompt:
     'You are a personal assistant agent.\n' +
     'You help me control my home using home automation tools.\n' +
-    'I have two independently controllable lights: my desk lamp (desk_light tool) and my PC tower LED strip (pc_light_color tool). ' +
+    'I have two independently controllable lights: my desk lamp (desk_light tool) and my PC tower lights (pc_light_color tool). ' +
+    'The PC tower lights include the chassis LED strip and the GPU RGB; pc_light_color always sets both together. ' +
     'When I say "lights" (plural) or otherwise do not name a specific light, apply the request to BOTH lights. ' +
     'When I name a specific light (e.g. "desk light" or "pc light"), only affect that one.\n' +
     'Call each necessary tool at most once.',
@@ -97,7 +98,7 @@ agent.Tool('desk_light', 'control power and/or light color emitted by my govee R
   return result || 'No lamp action requested (specify power and/or r,g,b and/or brightness).';
 });
 
-agent.Tool('pc_light_color', 'control light color emitted by my desktop PC tower chassis LED strip', {
+agent.Tool('pc_light_color', 'control light color emitted by my desktop PC chassis LED strip and GPU RGB. Always applies the same color and brightness to both OpenRGB devices.', {
   color: { type: 'string', description: 'hex format. ie. FF0000' },
   brightness: { type: 'integer', description: 'valid range is 0-50. default: 50' },
 }, ['color'], async (ctx, { color, brightness = 50 }) => {
@@ -105,7 +106,8 @@ agent.Tool('pc_light_color', 'control light color emitted by my desktop PC tower
   color = forceRx(/^[0-9A-f]{6}$/, color, '000000'); // string must match regex pattern, or it is replaced by default value 000000 (in the return value)
   brightness = clamp(forceInt(brightness, 0), 0, 50); // must be an integer between 0-50, or we get 0 by default.
   const rr = parseInt(color.slice(0, 2), 16) || 0, gg = parseInt(color.slice(2, 4), 16) || 0, bb = parseInt(color.slice(4, 6), 16) || 0;
-  const child = spawn('openrgb', ['-d', '0', '--mode', 'static', '--color', color, '--brightness', brightness]);
+  // Omit --device so OpenRGB applies to every detected device (chassis strip + GPU).
+  const child = spawn('openrgb', ['--mode', 'static', '--color', color, '--brightness', brightness]);
   debug('$ ' + child.cmd); // print full shell cmd being executed
   await child.promise; // wait for process to exit
   const ms = Date.now() - t0;
@@ -116,7 +118,7 @@ agent.Tool('pc_light_color', 'control light color emitted by my desktop PC tower
     (child.stdout ? `\n  \x1b[2mstdout:\x1b[0m ${child.stdout.trim()}` : '') +
     (child.stderr ? `\n  \x1b[2mstderr:\x1b[0m ${child.stderr.trim()}` : '')
   );
-  return ok ? `PC light is now color=${color} brightness=${brightness}.` : `Failed to affect PC light color. ${child.stdout} ${child.stderr}`;
+  return ok ? `PC lights (chassis + GPU) are now color=${color} brightness=${brightness}.` : `Failed to affect PC light color. ${child.stdout} ${child.stderr}`;
 });
 
 const prompt = process.argv.slice(2).join(' ');
