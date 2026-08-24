@@ -1,7 +1,10 @@
 import Agent from '../agent.mjs';
-import { spawn } from '../lib/spawn.mjs';
-import { debug, log } from '../lib/debug.mjs';
-import { forceInt, forceRx, clamp } from '../lib/validate.mjs';
+import {
+  alarm__create, alarm__list, alarm__update, alarm__delete,
+  alarm__show, alarm__snooze,
+  timer__create, timer__dismiss, timer__show,
+} from '/workspace/agl-common/lib/tool/adb.coffee';
+import { desk_light, pc_light_color } from '/workspace/agl-common/lib/tool/home.coffee';
 
 const _scriptStart = Date.now();
 
@@ -18,6 +21,12 @@ const agent = await Agent.factory({
     'The PC tower lights include the chassis LED strip and the GPU RGB; pc_light_color always sets both together. ' +
     'When I say "lights" (plural) or otherwise do not name a specific light, apply the request to BOTH lights. ' +
     'When I name a specific light (e.g. "desk light" or "pc light"), only affect that one.\n' +
+    'You can manage alarms and timers on my Google Pixel Clock app: ' +
+    'alarm__create, alarm__list, alarm__update, alarm__delete, alarm__show, alarm__snooze, ' +
+    'timer__create, timer__dismiss, timer__show. ' +
+    'Convert spoken times to 24-hour hour (0-23) and minute (0-59); e.g. "8am" is hour=8 minute=0, "8:30pm" is hour=20 minute=30. ' +
+    'Timer length is seconds (5 minutes → 300). Prefer matching existing alarms by label when deleting or updating. ' +
+    'alarm__list only reports the next scheduled alarm (Clock has no list intent). alarm__snooze only affects a currently ringing alarm.\n' +
     'Call each necessary tool at most once.',
   output_tool: {
     description: 'Report whether you were successful, along with a concise summary.',
@@ -33,93 +42,17 @@ const agent = await Agent.factory({
   },
 });
 
-agent.Tool('desk_light', 'control power and/or light color emitted by my govee RGB LED desk lamp. ' +
-  'If the request names or implies a color (e.g. "turn it blue", "set to forest green"), you MUST provide r, g, and b together. ' +
-  'Only provide power when the request is purely about turning the lamp on/off, with no color mentioned.', {
-  power: { type: 'boolean', description: 'turn the lamp on or off. omit this unless the request is only about power, not color.' },
-  r: { type: 'integer', description: 'red component. range 0-255. required together with g and b whenever a color is requested.' },
-  g: { type: 'integer', description: 'green component. range 0-255. required together with r and b whenever a color is requested.' },
-  b: { type: 'integer', description: 'blue component. range 0-255. required together with r and g whenever a color is requested.' },
-  brightness: { type: 'integer', description: 'valid range is 0-35. default: (remembers last setting). The perceived brightness change is highly non-linear, biased toward finer control at lower levels.' },
-}, [], async (ctx, { power, r, g, b, brightness }) => {
-  let result = '';
-
-  if (typeof power === 'boolean') {
-    const t0 = Date.now();
-    const power_s = power ? 'on' : 'off';
-    const child = spawn('govee', [power_s]);
-    debug('$ ' + child.cmd); // print full shell cmd being executed
-    await child.promise; // wait for process to exit
-    const ms = Date.now() - t0;
-    const ok = 0 == child.code;
-    console.error(
-      `\x1b[2m[${new Date().toISOString().slice(11, 23)}]\x1b[0m ` +
-      `${ok ? '🔌✅' : '🔌❌'} \x1b[1mdesk_light\x1b[0m power \x1b[38;2;255;200;60m$ ${child.cmd}\x1b[0m \x1b[2m(${ms}ms)\x1b[0m` +
-      (child.stdout ? `\n  \x1b[2mstdout:\x1b[0m ${child.stdout.trim()}` : '') +
-      (child.stderr ? `\n  \x1b[2mstderr:\x1b[0m ${child.stderr.trim()}` : '')
-    );
-    result += ok ? `lamp power is now ${power_s}. ` : `Failed to affect lamp power. ${child.stdout} ${child.stderr} `
-  }
-
-  if (r !== undefined || g !== undefined || b !== undefined) {
-    const t0 = Date.now();
-    r = clamp(forceInt(r, 0), 0, 255), g = clamp(forceInt(g, 0), 0, 255), b = clamp(forceInt(b, 0), 0, 255);
-    const child = spawn('govee', ['rgb', r, g, b]);
-    debug('$ ' + child.cmd); // print full shell cmd being executed
-    await child.promise; // wait for process to exit
-    const ms = Date.now() - t0;
-    const ok = 0 == child.code;
-    console.error(
-      `\x1b[2m[${new Date().toISOString().slice(11, 23)}]\x1b[0m ` +
-      `${ok ? '🎨✅' : '🎨❌'} \x1b[1mdesk_light\x1b[0m color \x1b[48;2;${r};${g};${b}m   \x1b[0m \x1b[38;2;${r};${g};${b}mrgb(${r},${g},${b})\x1b[0m \x1b[2m$ ${child.cmd}\x1b[0m \x1b[2m(${ms}ms)\x1b[0m` +
-      (child.stdout ? `\n  \x1b[2mstdout:\x1b[0m ${child.stdout.trim()}` : '') +
-      (child.stderr ? `\n  \x1b[2mstderr:\x1b[0m ${child.stderr.trim()}` : '')
-    );
-    result += ok ? `lamp light color is now rgb(${r},${g},${b}). ` : `Failed to affect lamp light color. ${child.stdout} ${child.stderr} `
-  }
-
-  if (brightness) {
-    const t0 = Date.now();
-    brightness = clamp(forceInt(brightness, 0), 0, 35); // must be an integer between 0-35, or we get 0 by default.
-    const child = spawn('govee', ['brightness', brightness]);
-    debug('$ ' + child.cmd); // print full shell cmd being executed
-    await child.promise; // wait for process to exit
-    const ms = Date.now() - t0;
-    const ok = 0 == child.code;
-    console.error(
-      `\x1b[2m[${new Date().toISOString().slice(11, 23)}]\x1b[0m ` +
-      `${ok ? '🔆✅' : '🔆❌'} \x1b[1mdesk_light\x1b[0m brightness \x1b[38;2;255;165;0m${brightness}\x1b[0m \x1b[2m$ ${child.cmd}\x1b[0m \x1b[2m(${ms}ms)\x1b[0m` +
-      (child.stdout ? `\n  \x1b[2mstdout:\x1b[0m ${child.stdout.trim()}` : '') +
-      (child.stderr ? `\n  \x1b[2mstderr:\x1b[0m ${child.stderr.trim()}` : '')
-    );
-    result += ok ? `lamp brightness=${brightness}.` : `Failed to affect lamp light brightness. ${child.stdout} ${child.stderr}`
-  }
-
-  return result || 'No lamp action requested (specify power and/or r,g,b and/or brightness).';
-});
-
-agent.Tool('pc_light_color', 'control light color emitted by my desktop PC chassis LED strip and GPU RGB. Always applies the same color and brightness to both OpenRGB devices.', {
-  color: { type: 'string', description: 'hex format. ie. FF0000' },
-  brightness: { type: 'integer', description: 'valid range is 0-50. default: 50' },
-}, ['color'], async (ctx, { color, brightness = 50 }) => {
-  const t0 = Date.now();
-  color = forceRx(/^[0-9A-f]{6}$/, color, '000000'); // string must match regex pattern, or it is replaced by default value 000000 (in the return value)
-  brightness = clamp(forceInt(brightness, 0), 0, 50); // must be an integer between 0-50, or we get 0 by default.
-  const rr = parseInt(color.slice(0, 2), 16) || 0, gg = parseInt(color.slice(2, 4), 16) || 0, bb = parseInt(color.slice(4, 6), 16) || 0;
-  // Omit --device so OpenRGB applies to every detected device (chassis strip + GPU).
-  const child = spawn('openrgb', ['--mode', 'static', '--color', color, '--brightness', brightness]);
-  debug('$ ' + child.cmd); // print full shell cmd being executed
-  await child.promise; // wait for process to exit
-  const ms = Date.now() - t0;
-  const ok = 0 == child.code;
-  console.error(
-    `\x1b[2m[${new Date().toISOString().slice(11, 23)}]\x1b[0m ` +
-    `${ok ? '🖥️✅' : '🖥️❌'} \x1b[1mpc_light_color\x1b[0m \x1b[48;2;${rr};${gg};${bb}m   \x1b[0m \x1b[38;2;${rr};${gg};${bb}m#${color}\x1b[0m \x1b[2m$ ${child.cmd}\x1b[0m \x1b[2m(${ms}ms)\x1b[0m` +
-    (child.stdout ? `\n  \x1b[2mstdout:\x1b[0m ${child.stdout.trim()}` : '') +
-    (child.stderr ? `\n  \x1b[2mstderr:\x1b[0m ${child.stderr.trim()}` : '')
-  );
-  return ok ? `PC lights (chassis + GPU) are now color=${color} brightness=${brightness}.` : `Failed to affect PC light color. ${child.stdout} ${child.stderr}`;
-});
+agent.Tool(desk_light);
+agent.Tool(pc_light_color);
+agent.Tool(alarm__create);
+agent.Tool(alarm__list);
+agent.Tool(alarm__update);
+agent.Tool(alarm__delete);
+agent.Tool(alarm__show);
+agent.Tool(alarm__snooze);
+agent.Tool(timer__create);
+agent.Tool(timer__dismiss);
+agent.Tool(timer__show);
 
 const prompt = process.argv.slice(2).join(' ');
 if (!prompt) {
@@ -131,6 +64,15 @@ if (!prompt) {
   console.error('  set pc light color to deep forest green');
   console.error('  set lights to purple');
   console.error('  turn off my desk light');
+  console.error('  set an alarm for 8am');
+  console.error('  set an alarm for 7:30 pm labeled gym');
+  console.error('  when is my next alarm');
+  console.error('  change the gym alarm to 7am');
+  console.error('  delete the gym alarm');
+  console.error('  snooze my alarm');
+  console.error('  show my alarms');
+  console.error('  start a 5 minute timer');
+  console.error('  show timers');
   process.exit(1);
 }
 

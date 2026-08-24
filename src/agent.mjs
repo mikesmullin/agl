@@ -386,8 +386,23 @@ export default class Agent {
 
   // tool registry
   tools = {};
-  // register a tool call
+  // register a tool call.
+  //   Tool(name, description, properties, required, fn)
+  //   Tool(fn)  — fn.name is the tool name; fn.description / fn.parameters / fn.required
   Tool(name, description, properties, required, fn) {
+    if (typeof name === 'function') {
+      fn = name;
+      name = fn.name;
+      description = fn.description;
+      properties = fn.parameters;
+      required = fn.required;
+    }
+    if (typeof name !== 'string' || !name) {
+      throw new Error('Tool: first argument must be a name string or a named function');
+    }
+    if (typeof fn !== 'function') {
+      throw new Error(`Tool ${name}: handler is not a function`);
+    }
     if (Object.keys(this.tools).length >= 128) throw new Error('Tool limit exceeded: maximum 128 tools allowed');
     fn._name = name;
     fn._description = description || '';

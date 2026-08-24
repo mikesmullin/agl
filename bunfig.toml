@@ -1,0 +1,2 @@
+# Lets Bun import shared .coffee tools from /workspace/agl-common.
+preload = ["/workspace/agl-common/node_modules/bun-coffeescript/register"]

@@ -56,6 +56,10 @@ agent.Tool('roulette_wheel', 'check if the square is a winner', {
   return ctx.magic_num == v1 ? 'winner' : 'loser';
 });
 
+// Or pass a named function that carries its own schema:
+//   fn.description / fn.parameters / fn.required  (name = fn.name)
+//   agent.Tool(desk_light)
+
 const magic_num = 18;
 const result1 = await agent.run({ prompt: 'Put my money on square eighteen', magic_num });
 log('', { result1 }); // => true
