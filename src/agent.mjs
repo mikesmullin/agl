@@ -992,6 +992,35 @@ Respond with:
   }
 
   /**
+   * Queue a user message to append after the current tool-result wave, before
+   * the next provider inference (same HTTP request as the tool results).
+   * Used by Ada `listen`: tool status is not Mike; his STT is this user row.
+   */
+  enqueueUserAfterTools(content) {
+    const t = String(content ?? '').trim();
+    if (!t) return;
+    if (!Array.isArray(this._pendingUserAfterTools)) {
+      this._pendingUserAfterTools = [];
+    }
+    this._pendingUserAfterTools.push(t);
+  }
+
+  _flushPendingUserAfterTools(retain, oneshot) {
+    const pending = this._pendingUserAfterTools;
+    this._pendingUserAfterTools = [];
+    if (!pending?.length) return;
+    for (const text of pending) {
+      const t = String(text || '').trim();
+      if (!t) continue;
+      if (retain) {
+        this.pushContext({ role: 'user', content: t, visible: true });
+      } else if (Array.isArray(oneshot)) {
+        oneshot.push({ role: 'user', content: t });
+      }
+    }
+  }
+
+  /**
    * Set visible on an item by id (manual compaction / eye toggle).
    * @returns {boolean} found
    */
@@ -1353,6 +1382,7 @@ Respond with:
           if (retain) this.pushContext(toolMsg);
           else oneshot.push(toolMsg);
         }
+        this._flushPendingUserAfterTools(retain, oneshot);
       } else {
         for (const call of allCalls) {
           const { args, content } = await runOneTool(call);
@@ -1375,6 +1405,7 @@ Respond with:
           if (retain) this.pushContext(toolMsg);
           else oneshot.push(toolMsg);
         }
+        this._flushPendingUserAfterTools(retain, oneshot);
       }
       // loop back to send tool results to the AI
     }

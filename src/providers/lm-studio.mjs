@@ -376,7 +376,7 @@ function _staticContextWindowSize(model) {
     m.includes('gemma-4-12b') ||
     m.includes('google/gemma-4-12b')
   ) {
-    return 120_000;
+    return 1_048_576;
   }
   if (m.includes('gemma-4') || m.includes('gemma4') || m.includes('e4b')) {
     return 32_768;
