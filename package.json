@@ -15,10 +15,14 @@
     "./providers/mycloud": "./src/providers/mycloud.mjs",
     "./providers/llama-server": "./src/providers/mycloud.mjs"
   },
+  "scripts": {
+    "test": "bun test"
+  },
   "files": [
     "src/agent.mjs",
     "src/lib/config.mjs",
     "src/lib/debug.mjs",
+    "src/lib/mini-handlebars.mjs",
     "src/providers/",
     "docs/"
   ],

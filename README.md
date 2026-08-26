@@ -26,7 +26,8 @@ import Agent from 'agl-ai';
 // Simple completion
 const agent = await Agent.factory({
   model: 'xai:grok-4-1-fast-reasoning',
-  system_prompt: 'You are a helpful assistant.',
+  system_prompt: 'You are a helpful assistant. The date is {{date}}.',
+  locals: { date: new Date().toLocaleString() }, // optional Handlebars-like substitution
   reasoning_effort: 'high', // optional; omitted/blank → provider default
 });
 const result = await agent.run({ prompt: 'What is 2+2?' });
@@ -68,6 +69,13 @@ const result2 = await agent.run({ prompt: 'I bet five is the winner', magic_num 
 log('', { result2 }); // => false
 ```
 
+`locals` is optional. When it is a plain object, `system_prompt` is compiled as a
+Handlebars-like template (`{{name}}`, `{{#if}}` / `{{#unless}}` / `{{#each}}` /
+`{{#with}}`, whitespace `~`, `\{{escape}}`) against those values, once at
+factory time. Omit `locals` and the prompt is unchanged — including any
+literal `{{...}}`. Implementation: [src/lib/mini-handlebars.mjs](src/lib/mini-handlebars.mjs)
+(no extra dependency).
+
 ## AI Providers
 
 These are supported.
@@ -98,7 +106,7 @@ read `.env` or persist provider tokens.
 bun src/agents/home.mjs turn on my desk light     # run an agent
 DEBUG=1 bun src/agents/home.mjs set lights red    # with debug logging
 
-bun test/unit/agent.mjs                           # run tests
+bun test                                          # unit tests (test/unit/)
 ```
 
 ## Related

@@ -1,4 +1,5 @@
 import { debug } from './lib/debug.mjs';
+import { applyLocals } from './lib/mini-handlebars.mjs';
 import * as xai from './providers/xai.mjs';
 import * as copilot from './providers/copilot.mjs';
 import * as ollama from './providers/ollama.mjs';
@@ -679,6 +680,9 @@ Respond with:
   static async factory({
     model,
     system_prompt,
+    // Optional Handlebars-like substitution against system_prompt (see
+    // src/lib/mini-handlebars.mjs). Omitted → system_prompt used as-is.
+    locals,
     output_tool,
     tool_choice,
     context_window, // legacy: number (max tokens) OR array (seed messages)
@@ -800,7 +804,7 @@ Respond with:
     if (!inst.client) {
       throw new Error(`Unknown AI provider: ${inst.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
     }
-    inst.system_prompt = system_prompt;
+    inst.system_prompt = applyLocals(system_prompt, locals);
     inst.tool_choice = tool_choice;
     await inst.client.init({
       base_url: inst.base_url,
