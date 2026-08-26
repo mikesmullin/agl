@@ -1,6 +1,10 @@
 import { debug } from '../lib/debug.mjs';
 import { setting } from '../lib/config.mjs';
+import { readFile, writeFile } from 'fs/promises';
+import { join } from 'path';
+
 const _defaultModel = 'claude-sonnet-5';
+const _tokensFileDefault = join(import.meta.dir, '../../.copilot_tokens.json');
 
 const _config = {
   copilot: {
@@ -32,14 +36,71 @@ async function environmentSession() {
   };
 }
 
+async function getCopilotToken(githubToken) {
+  const res = await fetch('https://api.github.com/copilot_internal/v2/token', {
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${githubToken}`,
+      'User-Agent': _config.copilot.user_agent,
+      'Editor-Version': _config.copilot.editor_version,
+      'Editor-Plugin-Version': _config.copilot.editor_plugin_version,
+    },
+  });
+  if (!res.ok) throw new Error(`Failed to get Copilot token: ${res.status} ${res.statusText}`);
+  return await res.json();
+}
+
+/**
+ * File-backed session for long-lived daemons (dad-proxy).
+ * Refreshes via github_token; does not start an interactive device flow.
+ */
+async function fileSession() {
+  const path = process.env.AGL_COPILOT_TOKENS_FILE || _tokensFileDefault;
+  let tokens;
+  try {
+    tokens = JSON.parse(await readFile(path, 'utf-8'));
+  } catch {
+    throw new Error(
+      `Copilot tokens file missing (${path}). Set AGL_COPILOT_* via tokenman, or create .copilot_tokens.json.`,
+    );
+  }
+  const stillGood =
+    tokens?.copilot_token &&
+    Number(tokens.expires_at) * 1000 > Date.now() + 60_000;
+  if (stillGood) {
+    tokens.api_url =
+      tokens.api_url || (await setting('copilot_api_url', _config.copilot.default_api_url));
+    return tokens;
+  }
+  if (!tokens?.github_token) {
+    throw new Error('Copilot token expired and no github_token in file to refresh.');
+  }
+  const data = await getCopilotToken(tokens.github_token);
+  tokens.copilot_token = data.token;
+  tokens.expires_at = data.expires_at;
+  tokens.api_url = data.endpoints?.api || _config.copilot.default_api_url;
+  try {
+    await writeFile(path, JSON.stringify(tokens, null, 2));
+  } catch (err) {
+    debug('copilot token file write failed.', err);
+  }
+  return tokens;
+}
+
 // --- public interface ---
 
 export async function init() {
-  _tokens = await environmentSession();
+  try {
+    _tokens = await environmentSession();
+    return;
+  } catch (envErr) {
+    debug('copilot env session unavailable; trying file tokens.', envErr);
+  }
+  _tokens = await fileSession();
 }
 
-async function _request({ method, uri, body, extraHeaders, signal }) {
-  if (!_tokens) throw new Error('copilot: call init() first');
+async function _fetch({ method, uri, body, extraHeaders, signal }) {
+  if (!_tokens) await init();
   const url = `${_tokens.api_url}${uri}`;
   const opts = {
     method,
@@ -57,10 +118,20 @@ async function _request({ method, uri, body, extraHeaders, signal }) {
   if (signal) opts.signal = signal;
   if (body) opts.body = JSON.stringify(body);
   debug('copilot _request.', { method, uri, body });
+  return fetch(url, opts);
+}
 
-  // NOTE: retry/backoff and per-call timeout are handled generically in the
-  // agent provider-invocation loop (applies to all providers), not here.
-  const res = await fetch(url, opts);
+async function _request({ method, uri, body, extraHeaders, signal }) {
+  let res = await _fetch({ method, uri, body, extraHeaders, signal });
+  if (res.status === 401) {
+    try {
+      _tokens = await fileSession();
+      res = await _fetch({ method, uri, body, extraHeaders, signal });
+    } catch {
+      throw new Error('Copilot authentication was rejected; run `tokenman refresh agl-copilot` and relaunch.');
+    }
+  }
+
   if (res.status === 401) {
     throw new Error('Copilot authentication was rejected; run `tokenman refresh agl-copilot` and relaunch.');
   }
@@ -120,6 +191,55 @@ async function _request({ method, uri, body, extraHeaders, signal }) {
 export async function models() {
   const res = await _request({ method: 'GET', uri: '/models' });
   return await res.json();
+}
+
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  if (!_tokens) await init();
+  const payload = { ...body, model: model || body?.model || _defaultModel };
+  delete payload.context_window;
+  const extra = {};
+  if (body?.context_window && body.context_window > 200000) {
+    extra['anthropic-beta'] = 'context-1m-2025-08-07';
+  }
+  const hasImages = (payload.messages || []).some(
+    (m) =>
+      Array.isArray(m.content) && m.content.some((p) => p?.type === 'image_url'),
+  );
+  if (hasImages) extra['Copilot-Vision-Request'] = 'true';
+
+  let res = await _fetch({
+    method: 'POST',
+    uri: '/chat/completions',
+    body: payload,
+    extraHeaders: extra,
+    signal,
+  });
+  if (res.status === 401) {
+    try {
+      _tokens = await fileSession();
+      res = await _fetch({
+        method: 'POST',
+        uri: '/chat/completions',
+        body: payload,
+        extraHeaders: extra,
+        signal,
+      });
+    } catch {
+      /* return the 401 */
+    }
+  }
+  return res;
+}
+
+export async function embeddingsRequest({ model, body, signal } = {}) {
+  if (!_tokens) await init();
+  const input = Array.isArray(body?.input) ? body.input : [body?.input];
+  return _fetch({
+    method: 'POST',
+    uri: '/embeddings',
+    body: { model: model || body?.model, input },
+    signal,
+  });
 }
 
 // New OpenAI-family Copilot models (currently GPT-5.6 Luna) are exposed only

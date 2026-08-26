@@ -13,7 +13,9 @@
     "./providers/lm-studio": "./src/providers/lm-studio.mjs",
     "./providers/muse": "./src/providers/muse.mjs",
     "./providers/mycloud": "./src/providers/mycloud.mjs",
-    "./providers/llama-server": "./src/providers/mycloud.mjs"
+    "./providers/llama-server": "./src/providers/mycloud.mjs",
+    "./providers/openai": "./src/providers/openai.mjs",
+    "./providers/anthropic": "./src/providers/anthropic.mjs"
   },
   "scripts": {
     "test": "bun test"

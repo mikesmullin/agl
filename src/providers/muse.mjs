@@ -36,7 +36,7 @@ export function defaultModel() {
   return _defaultModel;
 }
 
-async function _request({ method, uri, body, signal }) {
+async function _fetch({ method, uri, body, signal }) {
   if (!_key) await init();
   const opts = {
     method,
@@ -44,11 +44,17 @@ async function _request({ method, uri, body, signal }) {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${_key}`,
     },
+    signal,
   };
-  if (signal) opts.signal = signal;
-  if (body !== undefined) opts.body = JSON.stringify(body);
+  if (body !== undefined && method && method.toUpperCase() !== 'GET') {
+    opts.body = JSON.stringify(body);
+  }
   _debug('_request', { method, uri, body: body ? { ...body, messages: body.messages ? `[${body.messages.length}]` : undefined } : undefined });
-  const response = await fetch(`${_baseUrl}${uri}`, opts);
+  return fetch(`${_baseUrl}${uri}`, opts);
+}
+
+async function _request({ method, uri, body, signal }) {
+  const response = await _fetch({ method, uri, body, signal });
   if (response.ok) return response;
   const errorBody = await response.text();
   const errorDetails = {
@@ -74,6 +80,16 @@ async function _request({ method, uri, body, signal }) {
 export async function models() {
   const response = await _request({ method: 'GET', uri: '/v1/models' });
   return await response.json();
+}
+
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model || _defaultModel };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body: payload,
+    signal,
+  });
 }
 
 export async function inference({

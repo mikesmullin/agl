@@ -46,16 +46,15 @@ export function defaultModel() {
   return _defaultModel;
 }
 
-async function _request({ method, uri, body }) {
+async function _fetch({ method, uri, body, signal }) {
   if (!_baseUrl) await init();
   const headers = { 'Content-Type': 'application/json' };
-  // Only attach bearer if it looks like an inference auth key was intentionally set.
-  // Prefer RUNPOD_INFERENCE_API_KEY so the console RUNPOD_API_KEY is not sent to the pod.
   const inferKey = await config.read('RUNPOD_INFERENCE_API_KEY');
   if (inferKey) headers.Authorization = `Bearer ${inferKey}`;
-
-  const opts = { method, headers };
-  if (body !== undefined) opts.body = JSON.stringify(body);
+  const opts = { method, headers, signal };
+  if (body !== undefined && method && method.toUpperCase() !== 'GET') {
+    opts.body = JSON.stringify(body);
+  }
 
   debug('runpod _request.', {
     method,
@@ -66,7 +65,11 @@ async function _request({ method, uri, body }) {
       : undefined,
   });
 
-  const response = await fetch(`${_baseUrl}${uri}`, opts);
+  return fetch(`${_baseUrl}${uri}`, opts);
+}
+
+async function _request({ method, uri, body, signal }) {
+  const response = await _fetch({ method, uri, body, signal });
   if (response.ok) return response;
 
   const errorBody = await response.text();
@@ -87,6 +90,24 @@ async function _request({ method, uri, body }) {
 export async function models() {
   const response = await _request({ method: 'GET', uri: '/v1/models' });
   return await response.json();
+}
+
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  if (!_baseUrl) await init();
+  const payload = {
+    ...body,
+    model:
+      model ||
+      body?.model ||
+      (await config.read('RUNPOD_MODEL')) ||
+      _defaultModel,
+  };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body: payload,
+    signal,
+  });
 }
 
 /**

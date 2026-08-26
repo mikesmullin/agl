@@ -9,15 +9,23 @@ export async function init() {
   _baseUrl = await config.read('OLLAMA_BASE_URL') || 'http://localhost:11434';
 }
 
-// make an api request
-async function _request({ method, uri, body }) {
+async function _fetch({ method, uri, body, signal }) {
+  if (!_baseUrl) await init();
   debug('ollama _request.', { method, uri, body });
   const opts = {
     method,
     headers: { 'Content-Type': 'application/json' },
+    signal,
   };
-  if (body) opts.body = JSON.stringify(body);
-  const response = await fetch(`${_baseUrl}${uri}`, opts);
+  if (body !== undefined && method && method.toUpperCase() !== 'GET') {
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(`${_baseUrl}${uri}`, opts);
+}
+
+// make an api request
+async function _request({ method, uri, body, signal }) {
+  const response = await _fetch({ method, uri, body, signal });
   if (response.ok) {
     return response;
   }
@@ -34,6 +42,27 @@ async function _request({ method, uri, body }) {
 export async function models() {
   const response = await _request({ method: 'GET', uri: '/api/tags' });
   return await response.json();
+}
+
+/** OpenAI-compat path on Ollama (`/v1/chat/completions`) for gateway passthrough. */
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model || _defaultModel };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body: payload,
+    signal,
+  });
+}
+
+export async function embeddingsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/embeddings',
+    body: payload,
+    signal,
+  });
 }
 
 // request a completion (openai-compatible)

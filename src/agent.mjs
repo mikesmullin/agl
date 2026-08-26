@@ -7,6 +7,9 @@ import * as lmstudio from './providers/lm-studio.mjs';
 import * as runpod from './providers/runpod.mjs';
 import * as muse from './providers/muse.mjs';
 import * as mycloud from './providers/mycloud.mjs';
+import * as openai from './providers/openai.mjs';
+import * as anthropic from './providers/anthropic.mjs';
+import { openaiErrorResponse } from './lib/openai-gateway.mjs';
 
 const PROVIDERS = {
   xai,
@@ -17,6 +20,8 @@ const PROVIDERS = {
   muse,
   mycloud,
   'llama-server': mycloud,
+  openai,
+  anthropic,
 };
 
 /**
@@ -103,6 +108,208 @@ export async function resolveContextWindowAsync(spec, opts = {}) {
 
 /** Provider modules (for tests / advanced callers). */
 export { PROVIDERS as providers };
+
+function _normalizeGatewayProvider(name) {
+  if (name === 'lmstudio') return 'lm-studio';
+  if (name === 'github' || name === 'github-copilot') return 'copilot';
+  return name;
+}
+
+/**
+ * OpenAI-compatible chat completions passthrough for gateways (dad-proxy).
+ * Returns a fetch Response (SSE when body.stream). Does not run the agent loop.
+ *
+ * @param {object} body OpenAI chat.completions request body (`model` is provider:model)
+ * @param {{ signal?: AbortSignal }} [opts]
+ * @returns {Promise<Response>}
+ */
+export async function chatCompletions(body, { signal } = {}) {
+  if (!body || typeof body !== 'object') {
+    return openaiErrorResponse(400, 'Request body must be JSON', 'invalid_json');
+  }
+  if (!Array.isArray(body.messages)) {
+    return openaiErrorResponse(400, '`messages` array is required', 'missing_messages');
+  }
+  const raw = body.model || process.env.FAV_LOCAL_LLM || process.env.DEFAULT_MODEL;
+  if (!raw) {
+    return openaiErrorResponse(
+      400,
+      'No model specified and FAV_LOCAL_LLM is unset.',
+      'missing_model',
+    );
+  }
+  let { provider, model } = _splitProviderModel(raw);
+  provider = _normalizeGatewayProvider(provider);
+  const mod = PROVIDERS[provider];
+  if (!mod) {
+    return openaiErrorResponse(
+      400,
+      `Unknown provider "${provider}". Use one of: ${Object.keys(PROVIDERS).join(', ')}. Model format: provider:model`,
+      'unknown_provider',
+    );
+  }
+  if (typeof mod.chatCompletionsRequest !== 'function') {
+    return openaiErrorResponse(
+      501,
+      `Provider "${provider}" does not support chat completions passthrough`,
+      'unsupported',
+    );
+  }
+  try {
+    await mod.init?.({});
+  } catch (err) {
+    return openaiErrorResponse(
+      err.status || 500,
+      err.message || String(err),
+      err.code || 'init_error',
+    );
+  }
+  const extra = {};
+  if (provider === 'llama-server') {
+    extra.base_url = process.env.LLAMA_SERVER_BASE_URL || 'http://127.0.0.1:1234';
+    extra.api_key = process.env.LLAMA_SERVER_API_KEY || '';
+  }
+  try {
+    return await mod.chatCompletionsRequest({
+      model,
+      body: { ...body, model },
+      signal,
+      ...extra,
+    });
+  } catch (err) {
+    return openaiErrorResponse(
+      err.status || 502,
+      err.message || String(err),
+      err.code || 'upstream_error',
+    );
+  }
+}
+
+/**
+ * Aggregate OpenAI-shaped `/v1/models` from every provider that inits.
+ * @returns {Promise<{ object: string, data: object[] }>}
+ */
+export async function listModels() {
+  const data = [];
+  const seen = new Set();
+  const push = (id, owned_by) => {
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    data.push({ id, object: 'model', created: 0, owned_by });
+  };
+
+  const timeoutMs = Number(process.env.AGL_LIST_MODELS_TIMEOUT_MS || 4000);
+  const one = async (name, mod) => {
+    if (name === 'mycloud') return; // listed as llama-server
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      await Promise.race([
+        (async () => {
+          await mod.init?.({});
+          if (typeof mod.gatewayModels === 'function') {
+            const listed = await mod.gatewayModels();
+            for (const id of listed || []) push(id, name);
+            return;
+          }
+          if (typeof mod.models !== 'function') return;
+          const j = await mod.models();
+          const rows = j?.data || j?.models || [];
+          for (const row of rows) {
+            const id = typeof row === 'string' ? row : row?.id || row?.name || row?.model;
+            if (id) push(`${name}:${id}`, name);
+          }
+          if (Array.isArray(mod.KNOWN_MODELS)) {
+            for (const id of mod.KNOWN_MODELS) push(`${name}:${id}`, name);
+          }
+        })(),
+        new Promise((_, reject) => {
+          ac.signal.addEventListener('abort', () => reject(new Error('listModels timeout')));
+        }),
+      ]);
+    } catch (err) {
+      debug(`listModels ${name}:`, err?.message || err);
+      if (Array.isArray(mod.KNOWN_MODELS)) {
+        for (const id of mod.KNOWN_MODELS) push(`${name}:${id}`, name);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  await Promise.all(
+    Object.entries(PROVIDERS).map(([name, mod]) => one(name, mod)),
+  );
+
+  push('xai:grok-4.5', 'xai');
+  push('llama-server:gemma-4-12b-qat', 'llama-server');
+  return { object: 'list', data };
+}
+
+/**
+ * OpenAI-compatible embeddings passthrough.
+ * @param {object} body
+ * @param {{ signal?: AbortSignal }} [opts]
+ * @returns {Promise<Response>}
+ */
+export async function embeddingsRequest(body, { signal } = {}) {
+  if (!body || body.input == null) {
+    return openaiErrorResponse(400, '`input` is required', 'missing_input');
+  }
+  const raw = body.model || process.env.FAV_LOCAL_LLM || process.env.DEFAULT_MODEL;
+  if (!raw) {
+    return openaiErrorResponse(
+      400,
+      'No model specified and FAV_LOCAL_LLM is unset.',
+      'missing_model',
+    );
+  }
+  let { provider, model } = _splitProviderModel(raw);
+  provider = _normalizeGatewayProvider(provider);
+  const mod = PROVIDERS[provider];
+  if (!mod) {
+    return openaiErrorResponse(400, `Unknown provider "${provider}"`, 'unknown_provider');
+  }
+  if (typeof mod.embeddingsRequest !== 'function' && typeof mod.embeddings !== 'function') {
+    return openaiErrorResponse(
+      400,
+      `Provider "${provider}" does not support embeddings`,
+      'unsupported',
+    );
+  }
+  try {
+    await mod.init?.({});
+  } catch (err) {
+    return openaiErrorResponse(
+      err.status || 500,
+      err.message || String(err),
+      err.code || 'init_error',
+    );
+  }
+  try {
+    if (typeof mod.embeddingsRequest === 'function') {
+      return await mod.embeddingsRequest({
+        model,
+        body: { ...body, model },
+        signal,
+      });
+    }
+    const json = await mod.embeddings({
+      model,
+      input: body.input,
+    });
+    return new Response(JSON.stringify(json), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    return openaiErrorResponse(
+      err.status || 502,
+      err.message || String(err),
+      err.code || 'upstream_error',
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Generic provider-call resilience (applies to ALL providers).
@@ -363,6 +570,10 @@ function _toProviderMessage(m) {
 }
 
 export default class Agent {
+  static chatCompletions = chatCompletions;
+  static listModels = listModels;
+  static embeddings = embeddingsRequest;
+
   static default = {
     model: 'lm-studio:google/gemma-4-12b-qat',
     /** @deprecated use context_window_size — kept for factory back-compat (number) */

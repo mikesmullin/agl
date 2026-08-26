@@ -1,5 +1,6 @@
 import { debug } from '../lib/debug.mjs';
 import * as config from '../lib/config.mjs';
+import { openaiFetch } from '../lib/openai-gateway.mjs';
 
 let _key = '';
 const _baseUrl = 'https://api.x.ai';
@@ -32,23 +33,24 @@ export function defaultModel() {
   return _defaultModel;
 }
 
-// make an api request
-async function _request({ method, uri, body }) {
+async function _fetch({ method, uri, body, signal }) {
   if (!_key) {
     await init();
   }
-  const opts = {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${_key}`,
-    },
-  };
-  if (body !== undefined) {
-    opts.body = JSON.stringify(body);
-  }
   debug('xai _request.', { method, uri, body: body ? { ...body, messages: body.messages ? `[${body.messages.length}]` : undefined } : undefined });
-  const response = await fetch(`${_baseUrl}${uri}`, opts);
+  return openaiFetch({
+    baseUrl: _baseUrl,
+    path: uri,
+    method,
+    headers: { Authorization: `Bearer ${_key}` },
+    body,
+    signal,
+  });
+}
+
+// make an api request
+async function _request({ method, uri, body, signal }) {
+  const response = await _fetch({ method, uri, body, signal });
   if (response.ok) {
     return response;
   }
@@ -69,6 +71,29 @@ async function _request({ method, uri, body }) {
 export async function models() {
   const response = await _request({ method: 'GET', uri: '/v1/models' });
   return await response.json();
+}
+
+/**
+ * Raw OpenAI chat.completions passthrough (gateway). Returns fetch Response.
+ */
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model || _defaultModel };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body: payload,
+    signal,
+  });
+}
+
+export async function embeddingsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/embeddings',
+    body: payload,
+    signal,
+  });
 }
 
 /**

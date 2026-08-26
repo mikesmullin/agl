@@ -30,7 +30,8 @@ export async function init() {
 }
 
 // make an api request
-async function _request({ method, uri, body, signal }) {
+async function _fetch({ method, uri, body, signal }) {
+  if (!_baseUrl) await init();
   const opts = {
     method,
     headers: {
@@ -38,7 +39,6 @@ async function _request({ method, uri, body, signal }) {
     },
     signal,
   };
-  // Only attach a body for non-GET (some servers reject GET with body).
   if (method && method.toUpperCase() !== 'GET' && body !== undefined) {
     opts.body = JSON.stringify(body ?? {});
   }
@@ -47,14 +47,17 @@ async function _request({ method, uri, body, signal }) {
     uri,
     body: body !== undefined && method?.toUpperCase() !== 'GET' ? body : undefined,
   });
-  let response;
   try {
-    response = await fetch(`${_baseUrl}${uri}`, opts);
+    return await fetch(`${_baseUrl}${uri}`, opts);
   } catch (err) {
     const url = `${_baseUrl}${uri}`;
     const cause = err?.cause ? ` (${String(err.cause).slice(0, 200)})` : '';
     throw new Error(`Unable to connect to LM Studio at ${url}: ${err?.message || err}${cause}. Is LM Studio running? Check LM_STUDIO_BASE_URL (default http://127.0.0.1:1234) and that the model is loaded.`);
   }
+}
+
+async function _request({ method, uri, body, signal }) {
+  const response = await _fetch({ method, uri, body, signal });
   if (response.ok) {
     return response;
   }
@@ -172,6 +175,26 @@ export async function models() {
     const response = await _request({ method: 'GET', uri: '/v1/models' });
     return await response.json();
   }
+}
+
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model || _defaultModel };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body: payload,
+    signal,
+  });
+}
+
+export async function embeddingsRequest({ model, body, signal } = {}) {
+  const payload = { ...body, model: model || body?.model };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/embeddings',
+    body: payload,
+    signal,
+  });
 }
 
 // request a completion (openai-compatible)

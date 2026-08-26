@@ -5,18 +5,19 @@ import { homedir } from 'os';
 import { join } from 'path';
 
 /**
- * mycloud / llama-server — OpenAI-compatible GCE (or any) llama.cpp server.
+ * mycloud / llama-server — OpenAI-compatible llama.cpp server.
  *
  * Env (process-wide fallback):
- *   MYCLOUD_BASE_URL   — e.g. https://HOST:1234  (with or without /v1)
- *   MYCLOUD_MODEL      — default model id (default: qwen-3.8-27b)
- *   MYCLOUD_API_KEY    — required bearer (llama-server --api-key / --api-key-file)
- *   MYCLOUD_CA_FILE    — PEM CA/self-signed cert (default: ~/.mycloud/cert.pem)
+ *   MYCLOUD_BASE_URL / LLAMA_SERVER_BASE_URL
+ *     — e.g. https://HOST:1234 (GCE) or http://127.0.0.1:1234 (local).
+ *       Default when unset: http://127.0.0.1:1234
+ *   MYCLOUD_MODEL / LLAMA_SERVER_MODEL — default model id (default: qwen-3.8-27b)
+ *   MYCLOUD_API_KEY / LLAMA_SERVER_API_KEY
+ *     — required bearer for https://; optional for http:// (local llama-server
+ *       often has no --api-key)
+ *   MYCLOUD_CA_FILE — PEM CA (https only; default ~/.mycloud/cert.pem)
  *
- * Per-agent overrides (Agent.factory): base_url, api_key, ca_file.
- * Pass those when talking to a just-provisioned instance — process env may
- * still point at a previous VM. Hostname is not checked against the cert
- * (SAN is often the previous instance IP); the CA signature still is.
+ * Per-agent / per-request overrides: base_url, api_key, ca_file.
  */
 
 let _baseUrl = '';
@@ -34,6 +35,10 @@ function normalizeBase(url) {
 
 function skipHostname() {
   return undefined;
+}
+
+function isHttpUrl(url) {
+  return String(url || '').startsWith('http://');
 }
 
 async function tlsFetchOpts(caFile) {
@@ -77,19 +82,18 @@ export async function init(opts = {}) {
     _baseUrl = normalizeBase(
       (await config.read('MYCLOUD_BASE_URL')) ||
         (await config.read('LLAMA_SERVER_BASE_URL')) ||
-        '',
+        'http://127.0.0.1:1234',
     );
   }
-  if (opts.api_key) {
-    _apiKey = String(opts.api_key);
+  if (Object.prototype.hasOwnProperty.call(opts, 'api_key')) {
+    _apiKey = opts.api_key == null ? '' : String(opts.api_key);
   } else if (!_apiKey) {
     _apiKey =
       (await config.read('MYCLOUD_API_KEY')) ||
       (await config.read('LLAMA_SERVER_API_KEY')) ||
       '';
   }
-  // Per-request overrides (Agent.factory api_key/base_url) can fill these later.
-  if (opts.base_url || opts.api_key) return;
+  if (opts.base_url || Object.prototype.hasOwnProperty.call(opts, 'api_key')) return;
   if (!_baseUrl) {
     const err = new Error(
       'MYCLOUD_BASE_URL is missing (e.g. https://HOST:1234).',
@@ -97,7 +101,7 @@ export async function init(opts = {}) {
     err.code = 'MISSING_MYCLOUD_BASE_URL';
     throw err;
   }
-  if (!_apiKey) {
+  if (!_apiKey && !isHttpUrl(_baseUrl)) {
     const err = new Error(
       'MYCLOUD_API_KEY is missing. Export it (see ~/.bashrc) or llama-server will return 401.',
     );
@@ -110,20 +114,39 @@ export function defaultModel() {
   return _defaultModel;
 }
 
-async function _request({ method, uri, body, signal, base_url, api_key, ca_file }) {
+async function _fetch({ method, uri, body, signal, base_url, api_key, ca_file }) {
   let resolvedBase = normalizeBase(base_url) || _baseUrl;
-  let resolvedKey = api_key || _apiKey || (await config.read('MYCLOUD_API_KEY'));
-  if (!resolvedBase || !resolvedKey) {
-    await init({ base_url: resolvedBase, api_key: resolvedKey, ca_file });
-    resolvedBase = normalizeBase(base_url) || _baseUrl;
-    resolvedKey = api_key || _apiKey || (await config.read('MYCLOUD_API_KEY'));
+  let resolvedKey;
+  if (api_key !== undefined) {
+    resolvedKey = api_key || '';
+  } else {
+    resolvedKey =
+      _apiKey ||
+      (await config.read('MYCLOUD_API_KEY')) ||
+      (await config.read('LLAMA_SERVER_API_KEY')) ||
+      '';
   }
   if (!resolvedBase) {
-    const err = new Error('MYCLOUD_BASE_URL is missing (e.g. https://HOST:1234).');
+    await init({
+      base_url: resolvedBase,
+      ...(api_key !== undefined ? { api_key: resolvedKey } : {}),
+      ca_file,
+    });
+    resolvedBase = normalizeBase(base_url) || _baseUrl;
+    if (api_key === undefined) {
+      resolvedKey =
+        _apiKey ||
+        (await config.read('MYCLOUD_API_KEY')) ||
+        (await config.read('LLAMA_SERVER_API_KEY')) ||
+        '';
+    }
+  }
+  if (!resolvedBase) {
+    const err = new Error('MYCLOUD_BASE_URL is missing (e.g. https://HOST:1234 or http://127.0.0.1:1234).');
     err.code = 'MISSING_MYCLOUD_BASE_URL';
     throw err;
   }
-  if (!resolvedKey) {
+  if (!resolvedKey && !isHttpUrl(resolvedBase)) {
     const err = new Error(
       'MYCLOUD_API_KEY is missing. Export it (see ~/.bashrc) or llama-server will return 401.',
     );
@@ -131,9 +154,10 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
     throw err;
   }
   const headers = { 'Content-Type': 'application/json' };
-  headers.Authorization = `Bearer ${resolvedKey}`;
+  if (resolvedKey) headers.Authorization = `Bearer ${resolvedKey}`;
 
-  const opts = { method, headers, signal, ...(await tlsFetchOpts(ca_file)) };
+  const tlsOpts = isHttpUrl(resolvedBase) ? {} : await tlsFetchOpts(ca_file);
+  const opts = { method, headers, signal, ...tlsOpts };
   if (body !== undefined && method && method.toUpperCase() !== 'GET') {
     opts.body = JSON.stringify(body);
   }
@@ -147,9 +171,8 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
       : undefined,
   });
 
-  let response;
   try {
-    response = await fetch(`${resolvedBase}${uri}`, opts);
+    return await fetch(`${resolvedBase}${uri}`, opts);
   } catch (err) {
     const url = `${resolvedBase}${uri}`;
     const cause = err?.cause ? ` (${String(err.cause).slice(0, 200)})` : '';
@@ -157,6 +180,10 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
       `Unable to connect to llama-server at ${url}: ${err?.message || err}${cause}. Check MYCLOUD_BASE_URL.`,
     );
   }
+}
+
+async function _request({ method, uri, body, signal, base_url, api_key, ca_file }) {
+  const response = await _fetch({ method, uri, body, signal, base_url, api_key, ca_file });
   if (response.ok) return response;
 
   const errorBody = await response.text();
@@ -176,6 +203,53 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
 export async function models() {
   const response = await _request({ method: 'GET', uri: '/v1/models' });
   return await response.json();
+}
+
+export async function chatCompletionsRequest({
+  model,
+  body,
+  signal,
+  base_url,
+  api_key,
+  ca_file,
+} = {}) {
+  const payload = {
+    ...body,
+    model:
+      model ||
+      body?.model ||
+      (await config.read('MYCLOUD_MODEL')) ||
+      _defaultModel,
+  };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/chat/completions',
+    body: payload,
+    signal,
+    base_url,
+    api_key,
+    ca_file,
+  });
+}
+
+export async function embeddingsRequest({
+  model,
+  body,
+  signal,
+  base_url,
+  api_key,
+  ca_file,
+} = {}) {
+  const payload = { ...body, model: model || body?.model };
+  return _fetch({
+    method: 'POST',
+    uri: '/v1/embeddings',
+    body: payload,
+    signal,
+    base_url,
+    api_key,
+    ca_file,
+  });
 }
 
 export async function inference({
