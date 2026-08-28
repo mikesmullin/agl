@@ -85,9 +85,10 @@ These are supported.
 | xAI | `xai:<model>` | `XAI_API_KEY` env var |
 | Copilot | `copilot:<model>` | Tokenman-injected Copilot session |
 | Ollama | `ollama:<model>` | None (localhost) |
-| LM Studio | `lm-studio:<model>` | None (localhost) |
+| LM Studio | `lm-studio:<model>` | None (localhost LM Studio; native `/api/v0` plus OpenAI `/v1`) |
 | RunPod | `runpod:<model>` | `RUNPOD_BASE_URL` (OpenAI-compatible pod proxy/tunnel) |
-| mycloud / llama-server | `mycloud:<model>` or `llama-server:<model>` | `MYCLOUD_BASE_URL` + `MYCLOUD_API_KEY` (HTTPS llama.cpp, e.g. GCE `:1234`). Optional `MYCLOUD_CA_FILE` for a self-signed cert (default `~/.mycloud/cert.pem`). Override per agent with `Agent.factory({ base_url, api_key, ca_file })`. |
+| llama-server | `llama-server:<model>` | Local llama.cpp (default `http://127.0.0.1:1234`). Optional `LLAMA_SERVER_BASE_URL` / `LLAMA_SERVER_API_KEY`. Does not use `MYCLOUD_BASE_URL`. |
+| mycloud | `mycloud:<model>` | `MYCLOUD_BASE_URL` + `MYCLOUD_API_KEY` (HTTPS llama.cpp, e.g. GCE `:1234`). Optional `MYCLOUD_CA_FILE` for a self-signed cert (default `~/.mycloud/cert.pem`). Override per agent with `Agent.factory({ base_url, api_key, ca_file })`. |
 | Muse | `muse:<model>` | `MUSE_API_KEY` env var |
 
 Credentials are supplied through the process environment. With Tokenman:

@@ -25,6 +25,19 @@ const PROVIDERS = {
 };
 
 /**
+ * Local llama.cpp (`llama-server:`), not the remote mycloud VM.
+ * `llama-server` shares the mycloud provider module, so without this override
+ * it would inherit MYCLOUD_BASE_URL (GCE). Gateway and Agent.factory both
+ * bind it to localhost unless LLAMA_SERVER_BASE_URL is set.
+ */
+function _llamaServerEndpoint() {
+  return {
+    base_url: process.env.LLAMA_SERVER_BASE_URL || 'http://127.0.0.1:1234',
+    api_key: process.env.LLAMA_SERVER_API_KEY || '',
+  };
+}
+
+/**
  * Parse `provider:model` (or bare model) into parts.
  * @param {string} spec
  * @returns {{ provider: string|null, model: string }}
@@ -67,7 +80,7 @@ function _splitProviderModel(spec) {
  * (`loaded_context_length` from `/api/v0/models`); otherwise a static table.
  * Prefer {@link resolveContextWindowAsync} so LM Studio is refreshed first.
  *
- * @param {string} spec - e.g. "copilot:gpt-5.6-luna" or "lm-studio:google/gemma-4-12b-qat"
+ * @param {string} spec - e.g. "copilot:gpt-5.6-luna" or "llama-server:gemma-4-12b-qat"
  * @param {{ default?: number }} [opts]
  * @returns {number}
  */
@@ -164,11 +177,7 @@ export async function chatCompletions(body, { signal } = {}) {
       err.code || 'init_error',
     );
   }
-  const extra = {};
-  if (provider === 'llama-server') {
-    extra.base_url = process.env.LLAMA_SERVER_BASE_URL || 'http://127.0.0.1:1234';
-    extra.api_key = process.env.LLAMA_SERVER_API_KEY || '';
-  }
+  const extra = provider === 'llama-server' ? _llamaServerEndpoint() : {};
   try {
     return await mod.chatCompletionsRequest({
       model,
@@ -286,12 +295,14 @@ export async function embeddingsRequest(body, { signal } = {}) {
       err.code || 'init_error',
     );
   }
+  const extra = provider === 'llama-server' ? _llamaServerEndpoint() : {};
   try {
     if (typeof mod.embeddingsRequest === 'function') {
       return await mod.embeddingsRequest({
         model,
         body: { ...body, model },
         signal,
+        ...extra,
       });
     }
     const json = await mod.embeddings({
@@ -575,7 +586,7 @@ export default class Agent {
   static embeddings = embeddingsRequest;
 
   static default = {
-    model: 'lm-studio:google/gemma-4-12b-qat',
+    model: 'llama-server:gemma-4-12b-qat',
     /** @deprecated use context_window_size — kept for factory back-compat (number) */
     context_window: null,
     context_window_size: null,
@@ -918,8 +929,9 @@ Respond with:
     // Per-attempt wall-clock timeout (ms). Overrides AGL_TIMEOUT_MS for this agent.
     timeout_ms,
     // Per-agent provider endpoint / credential overrides (mycloud / llama-server).
-    // Needed when talking to a just-provisioned instance whose IP/key are not
-    // the process-wide MYCLOUD_BASE_URL / MYCLOUD_API_KEY.
+    // llama-server defaults to LLAMA_SERVER_BASE_URL or http://127.0.0.1:1234
+    // (not MYCLOUD_BASE_URL). mycloud still uses the process-wide GCE env.
+    // Pass these to talk to a just-provisioned instance whose IP/key differ.
     base_url,
     api_key,
     ca_file,
@@ -1014,6 +1026,11 @@ Respond with:
     inst.client = PROVIDERS[inst.provider];
     if (!inst.client) {
       throw new Error(`Unknown AI provider: ${inst.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
+    }
+    if (inst.provider === 'llama-server') {
+      const local = _llamaServerEndpoint();
+      if (inst.base_url == null) inst.base_url = local.base_url;
+      if (inst.api_key == null) inst.api_key = local.api_key;
     }
     inst.system_prompt = applyLocals(system_prompt, locals);
     inst.tool_choice = tool_choice;
@@ -1352,7 +1369,8 @@ Respond with:
       if (this.temperature != null) req.temperature = this.temperature;
       if (this.chat_template_kwargs) req.chat_template_kwargs = this.chat_template_kwargs;
       if (this.base_url) req.base_url = this.base_url;
-      if (this.api_key) req.api_key = this.api_key;
+      // Allow '' so llama-server does not inherit MYCLOUD_API_KEY.
+      if (this.api_key != null) req.api_key = this.api_key;
       if (this.ca_file) req.ca_file = this.ca_file;
       if (this.stream) req.stream = this.stream;
       if (this.stream && this.on_delta) req.on_delta = this.on_delta;
