@@ -42,6 +42,16 @@ const llama = await Agent.factory({
 });
 await llama.run({ prompt: '2+2?' });
 
+// dad-proxy (or any OpenAI-compat gateway): every provider:model is POSTed
+// there as-is. `host:port` becomes https://host:port.
+const viaProxy = await Agent.factory({
+  model: 'xai:grok-4.6',
+  proxy: 'host.containers.internal:1234',
+  api_key: process.env.DAD_PROXY_API_KEY,
+  ca_file: '/opt/certs/ca.pem',
+});
+await viaProxy.run({ prompt: '2+2?' });
+
 // Tool calling
 const agent = await Agent.factory({
   model: 'xai:grok-4-1-fast-reasoning',
@@ -89,6 +99,7 @@ These are supported.
 | RunPod | `runpod:<model>` | `RUNPOD_BASE_URL` (OpenAI-compatible pod proxy/tunnel) |
 | llama-server | `llama-server:<model>` | Local llama.cpp (default `http://127.0.0.1:1234`). Optional `LLAMA_SERVER_BASE_URL` / `LLAMA_SERVER_API_KEY`. Does not use `MYCLOUD_BASE_URL`. |
 | mycloud | `mycloud:<model>` | `MYCLOUD_BASE_URL` + `MYCLOUD_API_KEY` (HTTPS llama.cpp, e.g. GCE `:1234`). Optional `MYCLOUD_CA_FILE` for a self-signed cert (default `~/.mycloud/cert.pem`). Override per agent with `Agent.factory({ base_url, api_key, ca_file })`. |
+| gateway / dad-proxy | any `provider:model` | `Agent.factory({ proxy: 'host:port', api_key, ca_file })`. Skips native provider clients; POSTs OpenAI chat completions to the proxy with the full model id. |
 | Muse | `muse:<model>` | `MUSE_API_KEY` env var |
 
 Credentials are supplied through the process environment. With Tokenman:

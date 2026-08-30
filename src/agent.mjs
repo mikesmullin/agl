@@ -38,6 +38,20 @@ function _llamaServerEndpoint() {
 }
 
 /**
+ * OpenAI-compatible gateway (dad-proxy). `host:port` becomes `https://host:port`.
+ * A full URL is kept (trailing `/v1` stripped). Empty / null → no proxy.
+ * @param {unknown} proxy
+ * @returns {string}
+ */
+export function normalizeProxy(proxy) {
+  if (proxy == null) return '';
+  let s = String(proxy).trim();
+  if (!s) return '';
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `https://${s}`;
+  return s.replace(/\/+$/, '').replace(/\/v1$/i, '');
+}
+
+/**
  * Parse `provider:model` (or bare model) into parts.
  * @param {string} spec
  * @returns {{ provider: string|null, model: string }}
@@ -935,6 +949,11 @@ Respond with:
     base_url,
     api_key,
     ca_file,
+    // OpenAI-compatible gateway (dad-proxy). When set, ANY `provider:model`
+    // is POSTed to this endpoint (model id kept as `provider:model`).
+    // `host:port` → https://host:port; a full URL is kept. Still pass
+    // api_key / ca_file for HTTPS. Does not use native xAI/Anthropic/… clients.
+    proxy,
   } = {}) {
     const inst = new Agent();
     const resolvedModel = model || Agent.default.model;
@@ -1003,6 +1022,9 @@ Respond with:
     inst.base_url = base_url ?? null;
     inst.api_key = api_key ?? null;
     inst.ca_file = ca_file ?? null;
+    const proxyUrl = normalizeProxy(proxy);
+    inst.proxy = proxyUrl || null;
+    if (proxyUrl && inst.base_url == null) inst.base_url = proxyUrl;
     inst.stream = stream ?? false;
     inst.on_delta = on_delta ?? null;
     // When true, run() appends user/assistant/tool turns onto context_window
@@ -1023,14 +1045,20 @@ Respond with:
       inst.provider = resolvedModel.slice(0, idx);
       inst.model = resolvedModel.slice(idx + 1);
     }
-    inst.client = PROVIDERS[inst.provider];
-    if (!inst.client) {
-      throw new Error(`Unknown AI provider: ${inst.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
-    }
-    if (inst.provider === 'llama-server') {
-      const local = _llamaServerEndpoint();
-      if (inst.base_url == null) inst.base_url = local.base_url;
-      if (inst.api_key == null) inst.api_key = local.api_key;
+    if (proxyUrl) {
+      // Dad-proxy (and any OpenAI-compat gateway) routes on the full id.
+      inst.client = PROVIDERS['llama-server'];
+      inst.model = resolvedModel;
+    } else {
+      inst.client = PROVIDERS[inst.provider];
+      if (!inst.client) {
+        throw new Error(`Unknown AI provider: ${inst.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
+      }
+      if (inst.provider === 'llama-server') {
+        const local = _llamaServerEndpoint();
+        if (inst.base_url == null) inst.base_url = local.base_url;
+        if (inst.api_key == null) inst.api_key = local.api_key;
+      }
     }
     inst.system_prompt = applyLocals(system_prompt, locals);
     inst.tool_choice = tool_choice;
@@ -1042,16 +1070,21 @@ Respond with:
 
     const wideModelSpec = Agent.default.WIDE_MODEL;
     if (wideModelSpec) {
-      const widx = wideModelSpec.indexOf(':');
-      const wideProvider = widx > 0 && widx < wideModelSpec.length - 1 ? wideModelSpec.slice(0, widx) : null;
-      inst._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
-      inst._wideClient = wideProvider ? PROVIDERS[wideProvider] : inst.client;
-      if (inst._wideClient && inst._wideClient !== inst.client) {
-        await inst._wideClient.init({
-          base_url: inst.base_url,
-          api_key: inst.api_key,
-          ca_file: inst.ca_file,
-        });
+      if (proxyUrl) {
+        inst._wideModel = wideModelSpec;
+        inst._wideClient = inst.client;
+      } else {
+        const widx = wideModelSpec.indexOf(':');
+        const wideProvider = widx > 0 && widx < wideModelSpec.length - 1 ? wideModelSpec.slice(0, widx) : null;
+        inst._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
+        inst._wideClient = wideProvider ? PROVIDERS[wideProvider] : inst.client;
+        if (inst._wideClient && inst._wideClient !== inst.client) {
+          await inst._wideClient.init({
+            base_url: inst.base_url,
+            api_key: inst.api_key,
+            ca_file: inst.ca_file,
+          });
+        }
       }
     }
 
