@@ -439,11 +439,79 @@ export async function inference({
   };
 }
 
-export function contextWindowSize(model) {
+/**
+ * Static token budget by llama-server alias.
+ *
+ * Keep in sync with mari `~/.config/mari/activity/ai.yml`:
+ *   g  gemma-4-12b-qat   -c 1048576  (YaRN 4×, --yarn-orig-ctx 262144)
+ *   q  qwen3.8           -c 262144
+ *   m  muse-glimmer      -c 262144
+ *
+ * Do **not** trust `/v1/models` `meta.n_ctx` for Gemma: llama.cpp reports
+ * n_ctx_train / yarn-orig-ctx (262144) even when launched with -c 1048576.
+ *
+ * dad-proxy's `default` is whatever is loaded; locally that is the `g` gemma.
+ */
+function _staticContextWindowSize(model) {
   const m = String(model || '').toLowerCase();
   if (m.includes('qwen3.8') || m.includes('qwen-3.8') || m.includes('qwen3-8')) {
     return 1_048_576;
   }
-  if (m.includes('gemma-4') || m.includes('gemma4')) return 262_144;
+  if (m.includes('muse')) return 262_144;
+  if (
+    !m ||
+    m === 'default' ||
+    m.includes('gemma-4-12b') ||
+    m.includes('gemma-4') ||
+    m.includes('gemma4')
+  ) {
+    return 1_048_576;
+  }
   return 32_768;
+}
+
+const _ctxById = new Map();
+let _ctxFetchedAt = 0;
+const CTX_TTL_MS = 30_000;
+
+export async function refreshContextWindows(opts = {}) {
+  const force = Boolean(opts.force);
+  const now = Date.now();
+  if (!force && _ctxById.size && now - _ctxFetchedAt < CTX_TTL_MS) {
+    return _ctxById;
+  }
+  try {
+    const json = await models();
+    const rows = Array.isArray(json?.data) ? json.data : [];
+    _ctxById.clear();
+    for (const row of rows) {
+      const id = row?.id != null ? String(row.id) : '';
+      if (!id) continue;
+      const n = _staticContextWindowSize(id);
+      _ctxById.set(id, n);
+      _ctxById.set(id.toLowerCase(), n);
+      for (const a of row.aliases || []) {
+        const alias = String(a || '');
+        if (alias) _ctxById.set(alias, n);
+      }
+    }
+    // dad-proxy lists `default` plus every other provider. Do not steal
+    // anthropic/xai rows as the llama-server window.
+    if (!_ctxById.has('default')) {
+      _ctxById.set('default', _staticContextWindowSize('default'));
+    }
+    _ctxFetchedAt = now;
+  } catch (err) {
+    debug('llama-server refreshContextWindows failed.', err);
+  }
+  return _ctxById;
+}
+
+export function contextWindowSize(model) {
+  const key = String(model || 'default').toLowerCase();
+  if (_ctxById.has(key)) return _ctxById.get(key);
+  if ((!key || key === 'default') && _ctxById.has('default')) {
+    return _ctxById.get('default');
+  }
+  return _staticContextWindowSize(model);
 }
