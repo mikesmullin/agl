@@ -1582,7 +1582,9 @@ Respond with:
             call,
             args,
             content:
-              typeof result === 'string' ? result : JSON.stringify(result),
+              typeof result === 'string' || Array.isArray(result)
+                ? result
+                : JSON.stringify(result),
           };
         } catch (e) {
           return {

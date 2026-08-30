@@ -46,13 +46,39 @@ function openaiMessagesToAnthropic(messages) {
     }
 
     if (m.role === 'tool') {
+      let toolContent;
+      if (typeof m.content === 'string') {
+        toolContent = m.content;
+      } else if (Array.isArray(m.content)) {
+        toolContent = m.content.map((p) => {
+          if (p?.type === 'image_url') {
+            const url = p.image_url?.url || '';
+            const match = url.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              return {
+                type: 'image',
+                source: { type: 'base64', media_type: match[1], data: match[2] },
+              };
+            }
+          }
+          if (p?.type === 'image' && p.data) {
+            return {
+              type: 'image',
+              source: { type: 'base64', media_type: p.mimeType || 'image/png', data: p.data },
+            };
+          }
+          return { type: 'text', text: String(p?.text ?? '') };
+        });
+      } else {
+        toolContent = JSON.stringify(m.content);
+      }
       out.push({
         role: 'user',
         content: [
           {
             type: 'tool_result',
             tool_use_id: m.tool_call_id,
-            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+            content: toolContent,
           },
         ],
       });
