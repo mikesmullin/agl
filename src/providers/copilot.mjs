@@ -212,6 +212,40 @@ async function _responsesInference({ model, messages, tools, tool_choice, reason
   };
 }
 
+export async function chatCompletionsRequest({ model, body, signal } = {}) {
+  if (!_tokens) await init();
+  const requestBody = { ...(body || {}), model };
+  if (_responsesModels.has(model)) {
+    if (requestBody.stream) {
+      return new Response(JSON.stringify({
+        error: {
+          message: `Streaming is not supported for Copilot Responses model ${model}.`,
+          type: 'invalid_request_error',
+          code: 'streaming_not_supported',
+        },
+      }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+    const result = await _responsesInference({
+      model,
+      messages: requestBody.messages || [],
+      tools: requestBody.tools,
+      tool_choice: requestBody.tool_choice,
+      reasoning_effort: requestBody.reasoning_effort,
+      max_tokens: requestBody.max_tokens,
+    });
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  return _request({
+    method: 'POST',
+    uri: '/chat/completions',
+    body: requestBody,
+    signal,
+  });
+}
+
 // Consume an SSE stream (OpenAI-compat deltas) and assemble a single
 // non-streaming-shaped result: { choices:[{ message:{role,content}, finish_reason }], usage }.
 // `onChunk` (optional) is called after each network read to reset an idle timer.
