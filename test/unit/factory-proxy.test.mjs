@@ -1,12 +1,63 @@
-import { describe, expect, test } from 'bun:test';
-import Agent, { normalizeProxy, providers, resolveContextWindow } from '../../src/agent.mjs';
+import { describe, expect, test, afterEach } from 'bun:test';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import Agent, {
+  normalizeProxy,
+  providers,
+  resolveContextWindow,
+  resolveContextWindowAsync,
+} from '../../src/agent.mjs';
+
+const prevPath = process.env.AGL_CONFIG_PATH;
+
+function writeConfig(text) {
+  const dir = mkdtempSync(join(tmpdir(), 'agl-cfg-'));
+  const path = join(dir, 'config.yaml');
+  writeFileSync(path, text);
+  process.env.AGL_CONFIG_PATH = path;
+  return { dir, path };
+}
+
+afterEach(() => {
+  if (prevPath === undefined) delete process.env.AGL_CONFIG_PATH;
+  else process.env.AGL_CONFIG_PATH = prevPath;
+});
+
+const WINDOWS_YAML = `default_model: llama-server:gemma-4-12b-qat
+context_windows:
+  llama-server:
+    default: 1048576
+    gemma-4-12b-qat: 1048576
+  xai:
+    default: 131072
+    grok-4.6: 500000
+    grok-4.5: 131072
+    grok-4-0709: 131072
+`;
 
 describe('resolveContextWindow', () => {
-  test('grok-4.6 is 500k; other grok-4 stays 128k', () => {
+  test('reads provider → model sizes from the user config', () => {
+    writeConfig(WINDOWS_YAML);
     expect(resolveContextWindow('xai:grok-4.6')).toBe(500_000);
     expect(resolveContextWindow('grok-4.6')).toBe(500_000);
     expect(resolveContextWindow('xai:grok-4.5')).toBe(131_072);
     expect(resolveContextWindow('xai:grok-4-0709')).toBe(131_072);
+  });
+
+  test('llama-server lookup does not contact MYCLOUD_BASE_URL', async () => {
+    writeConfig(WINDOWS_YAML);
+    const prev = process.env.MYCLOUD_BASE_URL;
+    process.env.MYCLOUD_BASE_URL = 'https://192.0.2.1:1234';
+    try {
+      const t0 = Date.now();
+      const n = await resolveContextWindowAsync('llama-server:gemma-4-12b-qat');
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(n).toBe(1_048_576);
+    } finally {
+      if (prev == null) delete process.env.MYCLOUD_BASE_URL;
+      else process.env.MYCLOUD_BASE_URL = prev;
+    }
   });
 });
 

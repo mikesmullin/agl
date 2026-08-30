@@ -2,13 +2,6 @@ let _key = '';
 let _baseUrl = '';
 const _defaultModel = 'muse-spark-1.2-contributor';
 
-export const KNOWN_MODELS = [
-  'muse-1.2',
-  'muse-1.2-contributor',
-  'muse-spark-1.2',
-  'muse-spark',
-];
-
 function _debug(...args) {
   if (process.env.DEBUG) console.debug('[muse]', ...args);
 }
@@ -137,9 +130,4 @@ export async function smokeInference({ model = _defaultModel } = {}) {
   };
 }
 
-export function contextWindowSize(model) {
-  const m = String(model || '').toLowerCase();
-  if (m.includes('muse-1.2') || m.includes('muse-1')) return 131_072;
-  if (m.includes('muse')) return 131_072;
-  return 32_768;
-}
+

@@ -6,8 +6,6 @@ let _key = '';
 const _baseUrl = 'https://api.openai.com';
 const _defaultModel = 'gpt-4.1-mini';
 
-export const KNOWN_MODELS = ['gpt-4.1', 'gpt-4.1-mini', 'o4-mini'];
-
 export async function init() {
   _key = await config.read('OPENAI_API_KEY');
   if (!_key) {
@@ -101,9 +99,4 @@ export async function inference({
   return await response.json();
 }
 
-export function contextWindowSize(model) {
-  const m = String(model || '').toLowerCase();
-  if (m.includes('gpt-4.1')) return 1_047_576;
-  if (m.includes('o4')) return 200_000;
-  return 128_000;
-}
+

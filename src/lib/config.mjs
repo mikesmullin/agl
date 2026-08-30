@@ -1,27 +1,91 @@
+import { readFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 
 let settingsCache = null;
 
-function parseSimpleYaml(text) {
-  const out = {};
-  for (const line of String(text || '').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const match = trimmed.match(/^([\w.-]+)\s*:\s*(.*?)\s*$/);
-    if (!match) continue;
-    out[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
+/**
+ * Nested YAML subset: comments, maps, quoted/plain scalars, integers.
+ * Enough for ~/.config/agl/config.yaml (`default_model`, `context_windows`).
+ */
+export function parseYaml(text) {
+  const root = {};
+  const stack = [{ indent: -1, node: root }];
+
+  for (const rawLine of String(text || '').split('\n')) {
+    const stripped = stripInlineComment(rawLine);
+    if (!stripped.trim()) continue;
+    const indent = stripped.length - stripped.trimStart().length;
+    const trimmed = stripped.trim();
+    const colon = trimmed.indexOf(':');
+    if (colon < 0) continue;
+    const key = unquote(trimmed.slice(0, colon).trim());
+    if (!key) continue;
+    const rest = trimmed.slice(colon + 1).trim();
+
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) {
+      stack.pop();
+    }
+    const parent = stack[stack.length - 1].node;
+    if (rest === '') {
+      const child = {};
+      parent[key] = child;
+      stack.push({ indent, node: child });
+    } else {
+      parent[key] = coerceScalar(rest);
+    }
   }
-  return out;
+  return root;
+}
+
+function stripInlineComment(line) {
+  let inQuote = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === inQuote && line[i - 1] !== '\\') inQuote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inQuote = c;
+      continue;
+    }
+    if (c === '#' && (i === 0 || line[i - 1] === ' ' || line[i - 1] === '\t')) {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+function unquote(s) {
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function coerceScalar(raw) {
+  const s = unquote(raw);
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null' || s === '~') return null;
+  if (/^-?\d+$/.test(s)) return Number(s);
+  return s;
 }
 
 async function settings() {
   if (settingsCache !== null) return settingsCache;
   settingsCache = {};
   try {
-    const text = await readFile(resolve(import.meta.dir ?? '.', '../../config.yaml'), 'utf8');
-    Object.assign(settingsCache, parseSimpleYaml(text));
+    const text = await readFile(
+      resolve(import.meta.dir ?? '.', '../../config.yaml'),
+      'utf8',
+    );
+    Object.assign(settingsCache, parseYaml(text));
   } catch {
     // AGL has safe defaults for all non-secret configuration.
   }
@@ -43,7 +107,17 @@ export function userConfigPath() {
 export async function readUserConfig() {
   try {
     const text = await readFile(userConfigPath(), 'utf8');
-    return parseSimpleYaml(text);
+    return parseYaml(text);
+  } catch {
+    return {};
+  }
+}
+
+/** Sync counterpart for resolveContextWindow / listModels (no network). */
+export function readUserConfigSync() {
+  try {
+    const text = readFileSync(userConfigPath(), 'utf8');
+    return parseYaml(text);
   } catch {
     return {};
   }

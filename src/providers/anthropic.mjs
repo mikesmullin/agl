@@ -9,14 +9,6 @@ let _key = '';
 const _baseUrl = 'https://api.anthropic.com';
 const _defaultModel = 'claude-sonnet-4-5';
 
-export const KNOWN_MODELS = [
-  'claude-opus-4-5',
-  'claude-sonnet-4-5',
-  'claude-haiku-4-5',
-  'claude-sonnet-4-0',
-  'claude-3-5-haiku-latest',
-];
-
 export async function init() {
   _key = await config.read('ANTHROPIC_API_KEY');
   if (!_key) {
@@ -383,18 +375,6 @@ export async function chatCompletionsRequest({ model, body, signal } = {}) {
   });
 }
 
-export async function models() {
-  return {
-    object: 'list',
-    data: KNOWN_MODELS.map((id) => ({
-      id,
-      object: 'model',
-      created: 0,
-      owned_by: 'anthropic',
-    })),
-  };
-}
-
 export async function inference({
   model = _defaultModel,
   messages,
@@ -425,8 +405,4 @@ export async function inference({
   return await res.json();
 }
 
-export function contextWindowSize(model) {
-  const m = String(model || '').toLowerCase();
-  if (m.includes('opus') || m.includes('sonnet')) return 200_000;
-  return 200_000;
-}
+

@@ -25,12 +25,21 @@ Omit `model` (or pass `null` / `''`) to use the user default from
 
 ```yaml
 default_model: llama-server:gemma-4-12b-qat
+
+context_windows:
+  llama-server:
+    default: 1048576
+    gemma-4-12b-qat: 1048576
+  xai:
+    default: 131072
+    grok-4.6: 500000
 ```
 
-That file is re-read on every inference when the caller omitted a model, so
-changing `default_model` on disk switches every AGL-dependent app without a
-restart. Override the path with `AGL_CONFIG_PATH`. If the file is missing,
-AGL falls back to `llama-server:gemma-4-12b-qat`.
+That file is re-read on every inference when the caller omitted a model, and
+on every `resolveContextWindow` / `listModels` call, so a disk edit switches
+every AGL-dependent app without a restart and without probing providers.
+Override the path with `AGL_CONFIG_PATH`. If the file is missing, AGL falls
+back to `llama-server:gemma-4-12b-qat` and a 32_768 token window.
 
 ```js
 import Agent from 'agl-ai';

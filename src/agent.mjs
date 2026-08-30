@@ -10,7 +10,11 @@ import * as mycloud from './providers/mycloud.mjs';
 import * as openai from './providers/openai.mjs';
 import * as anthropic from './providers/anthropic.mjs';
 import { openaiErrorResponse } from './lib/openai-gateway.mjs';
-import { readUserDefaultModel, userConfigPath } from './lib/config.mjs';
+import {
+  readUserDefaultModel,
+  readUserConfigSync,
+  userConfigPath,
+} from './lib/config.mjs';
 
 /** Baked fallback when ~/.config/agl/config.yaml has no default_model. */
 const FALLBACK_DEFAULT_MODEL = 'llama-server:gemma-4-12b-qat';
@@ -110,12 +114,11 @@ function _splitProviderModel(spec) {
 
 /**
  * Resolve max context window (tokens) for a `provider:model` spec (or bare model
- * id if a single provider is obvious). Delegates to each provider's
- * `contextWindowSize(model)`.
+ * id if a single provider is obvious).
  *
- * For LM Studio this is **live** when the provider cache is warm
- * (`loaded_context_length` from `/api/v0/models`); otherwise a static table.
- * Prefer {@link resolveContextWindowAsync} so LM Studio is refreshed first.
+ * Reads `context_windows` from ~/.config/agl/config.yaml (or AGL_CONFIG_PATH)
+ * on every call — no network. Unknown ids fall back to that provider's
+ * `default` entry, then `opts.default` (32_768).
  *
  * @param {string} spec - e.g. "copilot:gpt-5.6-luna" or "llama-server:gemma-4-12b-qat"
  * @param {{ default?: number }} [opts]
@@ -126,37 +129,46 @@ export function resolveContextWindow(spec, opts = {}) {
     Number.isFinite(opts.default) && opts.default > 0 ? opts.default : 32_768;
   if (!spec) return fallback;
   const { provider, model } = _splitProviderModel(spec);
-  const mod = PROVIDERS[provider];
-  if (mod && typeof mod.contextWindowSize === 'function') {
-    const n = Number(mod.contextWindowSize(model));
-    if (Number.isFinite(n) && n > 0) return n;
-  }
-  return fallback;
+  const n = _lookupContextWindow(provider, model);
+  return n != null ? n : fallback;
 }
 
 /**
- * Like {@link resolveContextWindow}, but refreshes provider-side metadata first
- * (LM Studio: GET /api/v0/models → loaded_context_length).
+ * Same as {@link resolveContextWindow}. Kept async for callers that used to
+ * await a live provider refresh; now a disk re-read only.
  *
  * @param {string} spec
  * @param {{ default?: number, force?: boolean }} [opts]
  * @returns {Promise<number>}
  */
 export async function resolveContextWindowAsync(spec, opts = {}) {
-  const { provider } = _splitProviderModel(spec || '');
-  const mod = provider ? PROVIDERS[provider] : null;
-  if (mod && typeof mod.refreshContextWindows === 'function') {
-    try {
-      // llama-server shares the mycloud module; without this it inherits
-      // MYCLOUD_BASE_URL (often a down GCE VM) and TCP-SYN-timeouts ~127s.
-      const extra = provider === 'llama-server' ? _llamaServerEndpoint() : {};
-      await mod.init?.({ ...extra });
-      await mod.refreshContextWindows({ force: opts.force !== false });
-    } catch (err) {
-      debug('resolveContextWindowAsync refresh failed.', err);
+  return resolveContextWindow(spec, opts);
+}
+
+function _pickWindow(group, key) {
+  if (!key || group == null || typeof group !== 'object') return null;
+  if (!Object.prototype.hasOwnProperty.call(group, key)) return null;
+  const n = Number(group[key]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function _lookupContextWindow(provider, model) {
+  const windows = readUserConfigSync().context_windows;
+  if (!windows || typeof windows !== 'object') return null;
+  const group = windows[provider];
+  if (!group || typeof group !== 'object') return null;
+  const id = String(model || '').trim();
+  const exact = _pickWindow(group, id);
+  if (exact != null) return exact;
+  if (id) {
+    const lower = id.toLowerCase();
+    for (const [k, v] of Object.entries(group)) {
+      if (String(k).toLowerCase() !== lower) continue;
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
     }
   }
-  return resolveContextWindow(spec, opts);
+  return _pickWindow(group, 'default');
 }
 
 /** Provider modules (for tests / advanced callers). */
@@ -235,63 +247,24 @@ export async function chatCompletions(body, { signal } = {}) {
 }
 
 /**
- * Aggregate OpenAI-shaped `/v1/models` from every provider that inits.
+ * OpenAI-shaped `/v1/models` from `context_windows` in the user config.
+ * No provider HTTP. Re-reads disk every call. Skips each provider's `default` key.
  * @returns {Promise<{ object: string, data: object[] }>}
  */
 export async function listModels() {
   const data = [];
   const seen = new Set();
-  const push = (id, owned_by) => {
-    if (!id || seen.has(id)) return;
-    seen.add(id);
-    data.push({ id, object: 'model', created: 0, owned_by });
-  };
-
-  const timeoutMs = Number(process.env.AGL_LIST_MODELS_TIMEOUT_MS || 4000);
-  const one = async (name, mod) => {
-    if (name === 'mycloud') return; // listed as llama-server
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
-    try {
-      await Promise.race([
-        (async () => {
-          await mod.init?.({});
-          if (typeof mod.gatewayModels === 'function') {
-            const listed = await mod.gatewayModels();
-            for (const id of listed || []) push(id, name);
-            return;
-          }
-          if (typeof mod.models !== 'function') return;
-          const j = await mod.models();
-          const rows = j?.data || j?.models || [];
-          for (const row of rows) {
-            const id = typeof row === 'string' ? row : row?.id || row?.name || row?.model;
-            if (id) push(`${name}:${id}`, name);
-          }
-          if (Array.isArray(mod.KNOWN_MODELS)) {
-            for (const id of mod.KNOWN_MODELS) push(`${name}:${id}`, name);
-          }
-        })(),
-        new Promise((_, reject) => {
-          ac.signal.addEventListener('abort', () => reject(new Error('listModels timeout')));
-        }),
-      ]);
-    } catch (err) {
-      debug(`listModels ${name}:`, err?.message || err);
-      if (Array.isArray(mod.KNOWN_MODELS)) {
-        for (const id of mod.KNOWN_MODELS) push(`${name}:${id}`, name);
-      }
-    } finally {
-      clearTimeout(timer);
+  const windows = readUserConfigSync().context_windows || {};
+  for (const [provider, models] of Object.entries(windows)) {
+    if (!models || typeof models !== 'object' || Array.isArray(models)) continue;
+    for (const id of Object.keys(models)) {
+      if (id === 'default') continue;
+      const spec = `${provider}:${id}`;
+      if (seen.has(spec)) continue;
+      seen.add(spec);
+      data.push({ id: spec, object: 'model', created: 0, owned_by: provider });
     }
-  };
-
-  await Promise.all(
-    Object.entries(PROVIDERS).map(([name, mod]) => one(name, mod)),
-  );
-
-  push('xai:grok-4.5', 'xai');
-  push('llama-server:gemma-4-12b-qat', 'llama-server');
+  }
   return { object: 'list', data };
 }
 

@@ -524,28 +524,4 @@ export async function embeddings({ model, input }) {
   return await res.json();
 }
 
-/**
- * Max context window (tokens) for a Copilot model id (no provider: prefix).
- * Static table — Copilot does not expose this on the completion response.
- *
- * @param {string} model
- * @returns {number}
- */
-export function contextWindowSize(model) {
-  const m = String(model || '').toLowerCase();
-  // GPT-5.6 family (Luna / Terra / Sol) — 1M context
-  if (m.includes('gpt-5.6-luna') || m.includes('gpt-5.6-terra') || m.includes('gpt-5.6-sol')) {
-    return 1_000_000;
-  }
-  if (m.includes('gpt-5.6') || m.includes('gpt-5.5') || m.includes('gpt-5')) {
-    return 1_000_000;
-  }
-  // Claude via Copilot
-  if (m.includes('opus')) return 200_000;
-  if (m.includes('sonnet')) return 200_000;
-  if (m.includes('haiku')) return 200_000;
-  if (m.includes('fable')) return 200_000;
-  if (m.includes('claude')) return 200_000;
-  if (m.startsWith('gpt-4') || m.includes('gpt-4o')) return 128_000;
-  return 200_000; // Copilot enterprise default
-}
+

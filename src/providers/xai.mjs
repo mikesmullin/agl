@@ -7,17 +7,6 @@ const _baseUrl = 'https://api.x.ai';
 /** Default model: Grok 4.5 (chat completions API model id). */
 const _defaultModel = 'grok-4.5';
 
-/** Known xAI chat models (subset; API may return more via models()). */
-export const KNOWN_MODELS = [
-  'grok-4.6',
-  'grok-4.5',
-  'grok-4-1-fast-reasoning',
-  'grok-4-0709',
-  'grok-3',
-  'grok-3-mini',
-  'grok-2-1212',
-];
-
 // initialize provider
 export async function init() {
   _key = await config.read('XAI_API_KEY');
@@ -148,17 +137,4 @@ export async function smokeInference({ model = _defaultModel } = {}) {
   };
 }
 
-/**
- * Max context window (tokens) for an xAI / Grok model id.
- * @param {string} model
- * @returns {number}
- */
-export function contextWindowSize(model) {
-  const m = String(model || '').toLowerCase();
-  // Check 4.6 before generic grok-4 (the latter is a prefix of grok-4.6).
-  if (m.includes('grok-4.6') || m.includes('grok4.6')) return 500_000;
-  if (m.includes('grok-4') || m.includes('grok4')) return 131_072;
-  if (m.includes('grok-3') || m.includes('grok3')) return 131_072;
-  if (m.includes('grok')) return 131_072;
-  return 131_072;
-}
+
