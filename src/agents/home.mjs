@@ -11,8 +11,7 @@ const _scriptStart = Date.now();
 let finalOutput = { output: null, summary: '(agent produced no summary)' };
 
 const agent = await Agent.factory({
-  // model: 'ollama:gemma4:26b',
-  model: process.env.FAV_LOCAL_LLM,
+  // model omitted → ~/.config/agl/config.yaml default_model
   parallel_tools: true,
   system_prompt:
     'You are a personal assistant agent.\n' +

@@ -10,6 +10,29 @@ import * as mycloud from './providers/mycloud.mjs';
 import * as openai from './providers/openai.mjs';
 import * as anthropic from './providers/anthropic.mjs';
 import { openaiErrorResponse } from './lib/openai-gateway.mjs';
+import { readUserDefaultModel, userConfigPath } from './lib/config.mjs';
+
+/** Baked fallback when ~/.config/agl/config.yaml has no default_model. */
+const FALLBACK_DEFAULT_MODEL = 'llama-server:gemma-4-12b-qat';
+
+function _blankModel(model) {
+  return model == null || String(model).trim() === '';
+}
+
+/**
+ * Resolve the user default chat model.
+ * Re-reads ~/.config/agl/config.yaml (or AGL_CONFIG_PATH) every call so a disk
+ * edit takes effect without restarting AGL-dependent processes.
+ * @returns {Promise<string>} `provider:model`
+ */
+export async function resolveDefaultModel() {
+  const fromFile = await readUserDefaultModel();
+  if (fromFile) return fromFile;
+  const baked = String(Agent.default?.model || FALLBACK_DEFAULT_MODEL).trim();
+  return baked || FALLBACK_DEFAULT_MODEL;
+}
+
+export { userConfigPath };
 
 const PROVIDERS = {
   xai,
@@ -124,7 +147,10 @@ export async function resolveContextWindowAsync(spec, opts = {}) {
   const mod = provider ? PROVIDERS[provider] : null;
   if (mod && typeof mod.refreshContextWindows === 'function') {
     try {
-      await mod.init?.();
+      // llama-server shares the mycloud module; without this it inherits
+      // MYCLOUD_BASE_URL (often a down GCE VM) and TCP-SYN-timeouts ~127s.
+      const extra = provider === 'llama-server' ? _llamaServerEndpoint() : {};
+      await mod.init?.({ ...extra });
       await mod.refreshContextWindows({ force: opts.force !== false });
     } catch (err) {
       debug('resolveContextWindowAsync refresh failed.', err);
@@ -157,11 +183,11 @@ export async function chatCompletions(body, { signal } = {}) {
   if (!Array.isArray(body.messages)) {
     return openaiErrorResponse(400, '`messages` array is required', 'missing_messages');
   }
-  const raw = body.model || process.env.FAV_LOCAL_LLM || process.env.DEFAULT_MODEL;
+  const raw = _blankModel(body.model) ? await resolveDefaultModel() : String(body.model).trim();
   if (!raw) {
     return openaiErrorResponse(
       400,
-      'No model specified and FAV_LOCAL_LLM is unset.',
+      `No model specified and ${userConfigPath()} default_model is unset.`,
       'missing_model',
     );
   }
@@ -279,11 +305,11 @@ export async function embeddingsRequest(body, { signal } = {}) {
   if (!body || body.input == null) {
     return openaiErrorResponse(400, '`input` is required', 'missing_input');
   }
-  const raw = body.model || process.env.FAV_LOCAL_LLM || process.env.DEFAULT_MODEL;
+  const raw = _blankModel(body.model) ? await resolveDefaultModel() : String(body.model).trim();
   if (!raw) {
     return openaiErrorResponse(
       400,
-      'No model specified and FAV_LOCAL_LLM is unset.',
+      `No model specified and ${userConfigPath()} default_model is unset.`,
       'missing_model',
     );
   }
@@ -600,7 +626,8 @@ export default class Agent {
   static embeddings = embeddingsRequest;
 
   static default = {
-    model: 'llama-server:gemma-4-12b-qat',
+    /** Fallback when ~/.config/agl/config.yaml omits default_model. */
+    model: FALLBACK_DEFAULT_MODEL,
     /** @deprecated use context_window_size — kept for factory back-compat (number) */
     context_window: null,
     context_window_size: null,
@@ -913,6 +940,81 @@ Respond with:
     return String(feedback || '').trim();
   }
 
+  /**
+   * Bind provider + model id onto this instance and init the client.
+   * Used by factory and again on each run() when the caller omitted model
+   * (`_liveDefault`), so ~/.config/agl/config.yaml can change mid-process.
+   * @param {string} spec `provider:model`
+   */
+  async _bindModel(spec) {
+    const resolvedModel = String(spec || '').trim();
+    if (!resolvedModel) {
+      throw new Error(
+        `Agent.factory requires model or ${userConfigPath()} default_model`,
+      );
+    }
+    const idx = resolvedModel.indexOf(':');
+    if (idx <= 0 || idx >= resolvedModel.length - 1) {
+      throw new Error(`Invalid model format: ${resolvedModel}. Expected "provider:model".`);
+    }
+    this.provider = resolvedModel.slice(0, idx);
+    this.model = resolvedModel.slice(idx + 1);
+    this._boundSpec = resolvedModel;
+    this.base_url = this._factoryBaseUrl;
+    this.api_key = this._factoryApiKey;
+    if (this.proxy && this.base_url == null) this.base_url = this.proxy;
+    if (this.proxy) {
+      this.client = PROVIDERS['llama-server'];
+      this.model = resolvedModel;
+    } else {
+      this.client = PROVIDERS[this.provider];
+      if (!this.client) {
+        throw new Error(
+          `Unknown AI provider: ${this.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`,
+        );
+      }
+      if (this.provider === 'llama-server') {
+        const local = _llamaServerEndpoint();
+        if (this.base_url == null) this.base_url = local.base_url;
+        if (this.api_key == null) this.api_key = local.api_key;
+      }
+    }
+    await this.client.init({
+      base_url: this.base_url,
+      api_key: this.api_key,
+      ca_file: this.ca_file,
+    });
+
+    const wideModelSpec = Agent.default.WIDE_MODEL;
+    if (wideModelSpec) {
+      if (this.proxy) {
+        this._wideModel = wideModelSpec;
+        this._wideClient = this.client;
+      } else {
+        const widx = wideModelSpec.indexOf(':');
+        const wideProvider =
+          widx > 0 && widx < wideModelSpec.length - 1
+            ? wideModelSpec.slice(0, widx)
+            : null;
+        this._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
+        this._wideClient = wideProvider ? PROVIDERS[wideProvider] : this.client;
+        if (this._wideClient && this._wideClient !== this.client) {
+          await this._wideClient.init({
+            base_url: this.base_url,
+            api_key: this.api_key,
+            ca_file: this.ca_file,
+          });
+        }
+      }
+    }
+  }
+
+  async _bindDefaultModel() {
+    const spec = await resolveDefaultModel();
+    if (spec === this._boundSpec && this.client) return;
+    await this._bindModel(spec);
+  }
+
   static async factory({
     model,
     system_prompt,
@@ -956,7 +1058,8 @@ Respond with:
     proxy,
   } = {}) {
     const inst = new Agent();
-    const resolvedModel = model || Agent.default.model;
+    const explicit = _blankModel(model) ? '' : String(model).trim();
+    inst._liveDefault = !explicit;
     if (retries != null && Number.isFinite(Number(retries))) {
       // retries=0 → 1 attempt; retries=2 → 3 attempts
       inst.retry_attempts = Math.max(1, Math.floor(Number(retries)) + 1);
@@ -1019,8 +1122,10 @@ Respond with:
     inst.temperature = temperature ?? null;
     inst.chat_template_kwargs = chat_template_kwargs ?? null;
     inst.timeout_ms = timeout_ms ?? null;
-    inst.base_url = base_url ?? null;
-    inst.api_key = api_key ?? null;
+    inst._factoryBaseUrl = base_url ?? null;
+    inst._factoryApiKey = api_key ?? null;
+    inst.base_url = inst._factoryBaseUrl;
+    inst.api_key = inst._factoryApiKey;
     inst.ca_file = ca_file ?? null;
     const proxyUrl = normalizeProxy(proxy);
     inst.proxy = proxyUrl || null;
@@ -1034,59 +1139,10 @@ Respond with:
     inst.last_prompt_tokens = null;
     inst.last_completion_tokens = null;
     inst.last_total_tokens = null;
-    if (!resolvedModel) {
-      throw new Error('Agent.factory requires model or Agent.default.model');
-    }
-    {
-      const idx = resolvedModel.indexOf(':');
-      if (idx <= 0 || idx >= resolvedModel.length - 1) {
-        throw new Error(`Invalid model format: ${resolvedModel}. Expected "provider:model".`);
-      }
-      inst.provider = resolvedModel.slice(0, idx);
-      inst.model = resolvedModel.slice(idx + 1);
-    }
-    if (proxyUrl) {
-      // Dad-proxy (and any OpenAI-compat gateway) routes on the full id.
-      inst.client = PROVIDERS['llama-server'];
-      inst.model = resolvedModel;
-    } else {
-      inst.client = PROVIDERS[inst.provider];
-      if (!inst.client) {
-        throw new Error(`Unknown AI provider: ${inst.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
-      }
-      if (inst.provider === 'llama-server') {
-        const local = _llamaServerEndpoint();
-        if (inst.base_url == null) inst.base_url = local.base_url;
-        if (inst.api_key == null) inst.api_key = local.api_key;
-      }
-    }
+    const resolvedModel = explicit || (await resolveDefaultModel());
+    await inst._bindModel(resolvedModel);
     inst.system_prompt = applyLocals(system_prompt, locals);
     inst.tool_choice = tool_choice;
-    await inst.client.init({
-      base_url: inst.base_url,
-      api_key: inst.api_key,
-      ca_file: inst.ca_file,
-    });
-
-    const wideModelSpec = Agent.default.WIDE_MODEL;
-    if (wideModelSpec) {
-      if (proxyUrl) {
-        inst._wideModel = wideModelSpec;
-        inst._wideClient = inst.client;
-      } else {
-        const widx = wideModelSpec.indexOf(':');
-        const wideProvider = widx > 0 && widx < wideModelSpec.length - 1 ? wideModelSpec.slice(0, widx) : null;
-        inst._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
-        inst._wideClient = wideProvider ? PROVIDERS[wideProvider] : inst.client;
-        if (inst._wideClient && inst._wideClient !== inst.client) {
-          await inst._wideClient.init({
-            base_url: inst.base_url,
-            api_key: inst.api_key,
-            ca_file: inst.ca_file,
-          });
-        }
-      }
-    }
 
     if (output_tool) {
       inst.last_output = null;
@@ -1318,6 +1374,10 @@ Respond with:
 
     if (this.aborted || runSignal.aborted) {
       throw abortError(this._abortReason || 'user stop');
+    }
+
+    if (this._liveDefault) {
+      await this._bindDefaultModel();
     }
 
     if (!Array.isArray(this.context_window)) this.context_window = [];

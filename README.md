@@ -20,11 +20,28 @@ npm install agl-ai
 
 Below is a simplistic example from the unit tests:
 
+Omit `model` (or pass `null` / `''`) to use the user default from
+`~/.config/agl/config.yaml`:
+
+```yaml
+default_model: llama-server:gemma-4-12b-qat
+```
+
+That file is re-read on every inference when the caller omitted a model, so
+changing `default_model` on disk switches every AGL-dependent app without a
+restart. Override the path with `AGL_CONFIG_PATH`. If the file is missing,
+AGL falls back to `llama-server:gemma-4-12b-qat`.
+
 ```js
 import Agent from 'agl-ai';
 
-// Simple completion
+// Uses ~/.config/agl/config.yaml default_model
 const agent = await Agent.factory({
+  system_prompt: 'You are a helpful assistant.',
+});
+
+// Simple completion with an explicit model
+const grok = await Agent.factory({
   model: 'xai:grok-4-1-fast-reasoning',
   system_prompt: 'You are a helpful assistant. The date is {{date}}.',
   locals: { date: new Date().toLocaleString() }, // optional Handlebars-like substitution
