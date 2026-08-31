@@ -1,6 +1,12 @@
 import { debug } from '../lib/debug.mjs';
 import { setting } from '../lib/config.mjs';
+import { openaiErrorFromResponse } from '../lib/openai-gateway.mjs';
+import { access, readFile, writeFile } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { join } from 'path';
+
 const _defaultModel = 'claude-sonnet-5';
+const _tokensFileDefault = join(import.meta.dir, '../../.copilot_tokens.json');
 
 const _config = {
   copilot: {
@@ -14,12 +20,25 @@ const _config = {
 
 let _tokens = null;
 
+function tokensFilePath() {
+  return process.env.AGL_COPILOT_TOKENS_FILE || _tokensFileDefault;
+}
+
+async function tokensFileExists(path = tokensFilePath()) {
+  try {
+    await access(path, fsConstants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function environmentSession() {
   const githubToken = process.env.AGL_COPILOT_GITHUB_TOKEN;
   const copilotToken = process.env.AGL_COPILOT_TOKEN;
   const expiresAt = Number(process.env.AGL_COPILOT_EXPIRES_AT);
   if (!githubToken || !copilotToken || !expiresAt) {
-    throw new Error('AGL_COPILOT_GITHUB_TOKEN, AGL_COPILOT_TOKEN, and AGL_COPILOT_EXPIRES_AT are required; run `tokenman refresh agl-copilot` and launch through `op run`.');
+    throw new Error('AGL_COPILOT_GITHUB_TOKEN, AGL_COPILOT_TOKEN, and AGL_COPILOT_EXPIRES_AT are required; run `tokenman refresh agl-copilot` and launch through `op run`, or create .copilot_tokens.json.');
   }
   if (expiresAt * 1000 <= Date.now()) {
     throw new Error('AGL Copilot token is expired; run `tokenman refresh agl-copilot` and relaunch.');
@@ -32,14 +51,73 @@ async function environmentSession() {
   };
 }
 
+async function getCopilotToken(githubToken) {
+  const res = await fetch('https://api.github.com/copilot_internal/v2/token', {
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${githubToken}`,
+      'User-Agent': _config.copilot.user_agent,
+      'Editor-Version': _config.copilot.editor_version,
+      'Editor-Plugin-Version': _config.copilot.editor_plugin_version,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to get Copilot token: ${res.status} ${res.statusText}`);
+  }
+  return await res.json();
+}
+
+/**
+ * File-backed session for long-lived daemons (aigw / dad-proxy).
+ * Prefer this whenever `.copilot_tokens.json` exists — skip tokenman env.
+ * Refreshes via github_token; does not start an interactive device flow.
+ */
+async function fileSession() {
+  const path = tokensFilePath();
+  let tokens;
+  try {
+    tokens = JSON.parse(await readFile(path, 'utf-8'));
+  } catch {
+    throw new Error(
+      `Copilot tokens file missing (${path}). Set AGL_COPILOT_* via tokenman, or create .copilot_tokens.json.`,
+    );
+  }
+  const stillGood =
+    tokens?.copilot_token &&
+    Number(tokens.expires_at) * 1000 > Date.now() + 60_000;
+  if (stillGood) {
+    tokens.api_url =
+      tokens.api_url || (await setting('copilot_api_url', _config.copilot.default_api_url));
+    return tokens;
+  }
+  if (!tokens?.github_token) {
+    throw new Error('Copilot token expired and no github_token in file to refresh.');
+  }
+  const data = await getCopilotToken(tokens.github_token);
+  tokens.copilot_token = data.token;
+  tokens.expires_at = data.expires_at;
+  tokens.api_url = data.endpoints?.api || _config.copilot.default_api_url;
+  try {
+    await writeFile(path, JSON.stringify(tokens, null, 2));
+  } catch (err) {
+    debug('copilot token file write failed.', err);
+  }
+  return tokens;
+}
+
 // --- public interface ---
 
 export async function init() {
+  // Prefer on-disk tokens when present (no tokenman / op run required).
+  if (await tokensFileExists()) {
+    _tokens = await fileSession();
+    return;
+  }
   _tokens = await environmentSession();
 }
 
-async function _request({ method, uri, body, extraHeaders, signal }) {
-  if (!_tokens) throw new Error('copilot: call init() first');
+async function _fetch({ method, uri, body, extraHeaders, signal }) {
+  if (!_tokens) await init();
   const url = `${_tokens.api_url}${uri}`;
   const opts = {
     method,
@@ -57,10 +135,21 @@ async function _request({ method, uri, body, extraHeaders, signal }) {
   if (signal) opts.signal = signal;
   if (body) opts.body = JSON.stringify(body);
   debug('copilot _request.', { method, uri, body });
+  return fetch(url, opts);
+}
 
+async function _request({ method, uri, body, extraHeaders, signal }) {
   // NOTE: retry/backoff and per-call timeout are handled generically in the
   // agent provider-invocation loop (applies to all providers), not here.
-  const res = await fetch(url, opts);
+  let res = await _fetch({ method, uri, body, extraHeaders, signal });
+  if (res.status === 401 && (await tokensFileExists())) {
+    try {
+      _tokens = await fileSession();
+      res = await _fetch({ method, uri, body, extraHeaders, signal });
+    } catch {
+      throw new Error('Copilot authentication was rejected; refresh .copilot_tokens.json or run `tokenman refresh agl-copilot`.');
+    }
+  }
   if (res.status === 401) {
     throw new Error('Copilot authentication was rejected; run `tokenman refresh agl-copilot` and relaunch.');
   }
@@ -172,18 +261,81 @@ export function responsesToolChoice(toolChoice) {
   }
   return undefined;
 }
-
-async function _responsesInference({ model, messages, tools, tool_choice, reasoning_effort, max_tokens }) {
-  const body = { model, input: responsesInput(messages), store: false };
+function _buildResponsesBody({
+  model,
+  messages,
+  tools,
+  tool_choice,
+  reasoning_effort,
+  max_tokens,
+  stream = false,
+}) {
+  const body = {
+    model,
+    input: responsesInput(messages || []),
+    store: false,
+  };
+  if (stream) body.stream = true;
   const convertedTools = _responsesTools(tools);
   if (convertedTools.length) body.tools = convertedTools;
   const convertedToolChoice = responsesToolChoice(tool_choice);
   if (convertedToolChoice) body.tool_choice = convertedToolChoice;
   if (reasoning_effort) body.reasoning = { effort: reasoning_effort };
   if (max_tokens) body.max_output_tokens = max_tokens;
-  const hasImages = messages.some((message) => Array.isArray(message.content) && message.content.some((part) => part?.type === 'image_url'));
-  const extraHeaders = hasImages ? { 'Copilot-Vision-Request': 'true' } : {};
-  const res = await _request({ method: 'POST', uri: '/responses', body, extraHeaders });
+  return body;
+}
+
+function _responsesExtraHeaders(messages) {
+  const hasImages = (messages || []).some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some((part) => part?.type === 'image_url'),
+  );
+  return hasImages ? { 'Copilot-Vision-Request': 'true' } : {};
+}
+
+/** POST /responses with 401 file-token retry; returns raw fetch Response (ok or not). */
+async function _responsesFetch({ body, extraHeaders, signal }) {
+  let res = await _fetch({
+    method: 'POST',
+    uri: '/responses',
+    body,
+    extraHeaders,
+    signal,
+  });
+  if (res.status === 401 && (await tokensFileExists())) {
+    try {
+      _tokens = await fileSession();
+      res = await _fetch({
+        method: 'POST',
+        uri: '/responses',
+        body,
+        extraHeaders,
+        signal,
+      });
+    } catch {
+      /* keep original 401 */
+    }
+  }
+  return res;
+}
+
+async function _responsesInference({ model, messages, tools, tool_choice, reasoning_effort, max_tokens }) {
+  const body = _buildResponsesBody({
+    model,
+    messages,
+    tools,
+    tool_choice,
+    reasoning_effort,
+    max_tokens,
+    stream: false,
+  });
+  const res = await _request({
+    method: 'POST',
+    uri: '/responses',
+    body,
+    extraHeaders: _responsesExtraHeaders(messages),
+  });
   const result = await res.json();
   const toolCalls = [];
   const texts = [];
@@ -212,22 +364,223 @@ async function _responsesInference({ model, messages, tools, tool_choice, reason
   };
 }
 
+/**
+ * Translate Copilot/OpenAI Responses SSE → OpenAI chat.completion.chunk SSE
+ * so VS Code / aigw clients using apiType=chat-completions can stream Luna/Terra/Sol.
+ */
+function streamResponsesToOpenAI(res, model) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let id = `chatcmpl-${crypto.randomUUID().slice(0, 12)}`;
+  const created = Math.floor(Date.now() / 1000);
+  /** @type {Map<string, number>} */
+  const toolIndexByItem = new Map();
+  let nextToolIndex = 0;
+  let sawToolCall = false;
+  let finishReason = 'stop';
+  let usage;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (obj) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      };
+      const chunk = (delta, finish = null, extra = {}) => ({
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta, finish_reason: finish }],
+        ...extra,
+      });
+
+      send(chunk({ role: 'assistant', content: '' }));
+
+      let buf = '';
+      const reader = res.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let sep;
+          while ((sep = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, sep).trimEnd();
+            buf = buf.slice(sep + 1);
+            if (!line.startsWith('data:')) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === '[DONE]') continue;
+            let evt;
+            try {
+              evt = JSON.parse(raw);
+            } catch {
+              continue;
+            }
+            const type = evt.type || '';
+
+            if (type === 'response.created' || type === 'response.in_progress') {
+              // Keep a stable chatcmpl-* id for all chunks (OpenAI chat clients
+              // expect one id for the whole stream). Capture upstream model only.
+              if (evt.response?.model) model = evt.response.model;
+              continue;
+            }
+
+            if (type === 'response.output_text.delta' && evt.delta) {
+              send(chunk({ content: String(evt.delta) }));
+              continue;
+            }
+
+            // Reasoning / thinking deltas (when present)
+            if (
+              (type === 'response.reasoning_summary_text.delta' ||
+                type === 'response.reasoning_text.delta') &&
+              evt.delta
+            ) {
+              send(
+                chunk({
+                  reasoning_content: String(evt.delta),
+                  reasoning_text: String(evt.delta),
+                }),
+              );
+              continue;
+            }
+
+            if (type === 'response.output_item.added' && evt.item?.type === 'function_call') {
+              sawToolCall = true;
+              const itemKey = String(evt.item.id || evt.output_index || nextToolIndex);
+              const idx = nextToolIndex++;
+              toolIndexByItem.set(itemKey, idx);
+              if (evt.item.id) toolIndexByItem.set(String(evt.item.id), idx);
+              send(
+                chunk({
+                  tool_calls: [
+                    {
+                      index: idx,
+                      id: evt.item.call_id || evt.item.id,
+                      type: 'function',
+                      function: {
+                        name: evt.item.name || '',
+                        arguments: evt.item.arguments || '',
+                      },
+                    },
+                  ],
+                }),
+              );
+              continue;
+            }
+
+            if (type === 'response.function_call_arguments.delta' && evt.delta) {
+              sawToolCall = true;
+              const itemKey = String(evt.item_id || evt.output_index || '');
+              const idx =
+                toolIndexByItem.has(itemKey)
+                  ? toolIndexByItem.get(itemKey)
+                  : (evt.output_index ?? Math.max(0, nextToolIndex - 1));
+              send(
+                chunk({
+                  tool_calls: [
+                    {
+                      index: idx,
+                      function: { arguments: String(evt.delta) },
+                    },
+                  ],
+                }),
+              );
+              continue;
+            }
+
+            if (type === 'response.completed' || type === 'response.incomplete') {
+              // Keep a stable chatcmpl-* id for all chunks; only capture model/usage.
+              if (evt.response?.model) model = evt.response.model;
+              if (evt.response?.usage) {
+                usage = {
+                  prompt_tokens: evt.response.usage.input_tokens,
+                  completion_tokens: evt.response.usage.output_tokens,
+                  total_tokens: evt.response.usage.total_tokens,
+                };
+              }
+              if (type === 'response.incomplete') finishReason = 'length';
+              else if (sawToolCall) finishReason = 'tool_calls';
+              else finishReason = 'stop';
+              continue;
+            }
+
+            if (type === 'response.failed' || type === 'error' || type === 'response.error') {
+              const msg =
+                evt.message ||
+                evt.error?.message ||
+                evt.response?.error?.message ||
+                'Responses stream failed';
+              send({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                error: { message: String(msg), type: 'server_error' },
+              });
+              finishReason = 'stop';
+            }
+          }
+        }
+      } catch (err) {
+        controller.error(err);
+        return;
+      }
+
+      if (sawToolCall && finishReason === 'stop') finishReason = 'tool_calls';
+      send(
+        chunk(
+          {},
+          finishReason,
+          usage ? { usage } : {},
+        ),
+      );
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+}
+
 export async function chatCompletionsRequest({ model, body, signal } = {}) {
   if (!_tokens) await init();
   const requestBody = { ...(body || {}), model };
   if (_responsesModels.has(model)) {
+    const messages = requestBody.messages || [];
+    const responsesBody = _buildResponsesBody({
+      model,
+      messages,
+      tools: requestBody.tools,
+      tool_choice: requestBody.tool_choice,
+      reasoning_effort: requestBody.reasoning_effort,
+      max_tokens: requestBody.max_tokens,
+      stream: Boolean(requestBody.stream),
+    });
+    const extraHeaders = _responsesExtraHeaders(messages);
+
     if (requestBody.stream) {
-      return new Response(JSON.stringify({
-        error: {
-          message: `Streaming is not supported for Copilot Responses model ${model}.`,
-          type: 'invalid_request_error',
-          code: 'streaming_not_supported',
-        },
-      }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      const res = await _responsesFetch({
+        body: responsesBody,
+        extraHeaders,
+        signal,
+      });
+      if (!res.ok) return openaiErrorFromResponse(res, 'copilot');
+      return streamResponsesToOpenAI(res, model);
     }
+
     const result = await _responsesInference({
       model,
-      messages: requestBody.messages || [],
+      messages,
       tools: requestBody.tools,
       tool_choice: requestBody.tool_choice,
       reasoning_effort: requestBody.reasoning_effort,
