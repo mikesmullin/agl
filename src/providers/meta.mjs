@@ -3,7 +3,7 @@ let _baseUrl = '';
 const _defaultModel = 'muse-spark-1.2-contributor';
 
 function _debug(...args) {
-  if (process.env.DEBUG) console.debug('[muse]', ...args);
+  if (process.env.DEBUG) console.debug('[meta]', ...args);
 }
 
 async function _readEnv(name) {
@@ -11,7 +11,8 @@ async function _readEnv(name) {
 }
 
 export async function init() {
-  _key = await _readEnv('MUSE_API_KEY');
+  // Prefer META_API_KEY; keep MUSE_API_KEY as a legacy alias.
+  _key = (await _readEnv('META_API_KEY')) || (await _readEnv('MUSE_API_KEY'));
   // Hard-coded Meta Muse endpoint per project requirement
   _baseUrl = 'https://api.meta.ai/v1';
 
@@ -19,8 +20,10 @@ export async function init() {
   if (_baseUrl.endsWith('/v1')) _baseUrl = _baseUrl.slice(0, -3);
 
   if (!_key) {
-    const err = new Error('MUSE_API_KEY is missing. Copy .env.example to .env and set MUSE_API_KEY, or export MUSE_API_KEY in your shell.');
-    err.code = 'MISSING_MUSE_API_KEY';
+    const err = new Error(
+      'META_API_KEY (or legacy MUSE_API_KEY) is missing. Export META_API_KEY in your shell or .env.',
+    );
+    err.code = 'MISSING_META_API_KEY';
     throw err;
   }
 }
@@ -57,9 +60,9 @@ async function _request({ method, uri, body, signal }) {
     body: errorBody,
   };
   _debug('request error', errorDetails);
-  console.error(`[muse] ${response.status} ${response.statusText}`);
-  if (errorBody) console.error(`[muse] response body: ${errorBody.slice(0, 2000)}`);
-  const err = new Error(`Muse request error: ${response.status} ${response.statusText}`);
+  console.error(`[meta] ${response.status} ${response.statusText}`);
+  if (errorBody) console.error(`[meta] response body: ${errorBody.slice(0, 2000)}`);
+  const err = new Error(`Meta request error: ${response.status} ${response.statusText}`);
   err.status = response.status;
   err.body = errorBody;
   try {
@@ -96,8 +99,8 @@ export async function inference({
 } = {}) {
   const body = { model: model || _defaultModel, messages };
   if (tools?.length) body.tools = tools;
-  // Muse only supports "auto" — when output_tool is defined (tools present),
-  // Agent sets tool_choice="required" but Muse rejects it, so map to "auto"
+  // Meta Muse only supports "auto" — when output_tool is defined (tools present),
+  // Agent sets tool_choice="required" but Meta rejects it, so map to "auto"
   if (tools?.length) {
     body.tool_choice = "auto";
   } else if (tool_choice !== undefined) {

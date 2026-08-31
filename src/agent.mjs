@@ -5,7 +5,7 @@ import * as copilot from './providers/copilot.mjs';
 import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
 import * as runpod from './providers/runpod.mjs';
-import * as muse from './providers/muse.mjs';
+import * as meta from './providers/meta.mjs';
 import * as mycloud from './providers/mycloud.mjs';
 import * as openai from './providers/openai.mjs';
 import * as anthropic from './providers/anthropic.mjs';
@@ -44,7 +44,9 @@ const PROVIDERS = {
   ollama,
   'lm-studio': lmstudio,
   runpod,
-  muse,
+  meta,
+  // Legacy alias for Meta Muse API
+  muse: meta,
   mycloud,
   'llama-server': mycloud,
   openai,
@@ -155,20 +157,36 @@ function _pickWindow(group, key) {
 function _lookupContextWindow(provider, model) {
   const windows = readUserConfigSync().context_windows;
   if (!windows || typeof windows !== 'object') return null;
-  const group = windows[provider];
-  if (!group || typeof group !== 'object') return null;
+  // Prefer canonical provider key; fall back to legacy alias groups.
+  const groups = [];
+  const primary = windows[provider];
+  if (primary && typeof primary === 'object') groups.push(primary);
+  if (provider === 'meta' && windows.muse && windows.muse !== primary) {
+    groups.push(windows.muse);
+  } else if (provider === 'muse' && windows.meta && windows.meta !== primary) {
+    groups.push(windows.meta);
+  }
+  if (!groups.length) return null;
   const id = String(model || '').trim();
-  const exact = _pickWindow(group, id);
-  if (exact != null) return exact;
+  for (const group of groups) {
+    const exact = _pickWindow(group, id);
+    if (exact != null) return exact;
+  }
   if (id) {
     const lower = id.toLowerCase();
-    for (const [k, v] of Object.entries(group)) {
-      if (String(k).toLowerCase() !== lower) continue;
-      const n = Number(v);
-      if (Number.isFinite(n) && n > 0) return n;
+    for (const group of groups) {
+      for (const [k, v] of Object.entries(group)) {
+        if (String(k).toLowerCase() !== lower) continue;
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
     }
   }
-  return _pickWindow(group, 'default');
+  for (const group of groups) {
+    const d = _pickWindow(group, 'default');
+    if (d != null) return d;
+  }
+  return null;
 }
 
 /** Provider modules (for tests / advanced callers). */
@@ -177,6 +195,8 @@ export { PROVIDERS as providers };
 function _normalizeGatewayProvider(name) {
   if (name === 'lmstudio') return 'lm-studio';
   if (name === 'github' || name === 'github-copilot') return 'copilot';
+  // Canonical provider id is `meta`; keep `muse` as a legacy alias.
+  if (name === 'muse') return 'meta';
   return name;
 }
 
@@ -255,8 +275,10 @@ export async function listModels() {
   const data = [];
   const seen = new Set();
   const windows = readUserConfigSync().context_windows || {};
-  for (const [provider, models] of Object.entries(windows)) {
+  for (const [providerRaw, models] of Object.entries(windows)) {
     if (!models || typeof models !== 'object' || Array.isArray(models)) continue;
+    // Collapse legacy provider aliases onto the canonical id in the catalog.
+    const provider = _normalizeGatewayProvider(providerRaw);
     for (const id of Object.keys(models)) {
       if (id === 'default') continue;
       const spec = `${provider}:${id}`;
@@ -930,9 +952,9 @@ Respond with:
     if (idx <= 0 || idx >= resolvedModel.length - 1) {
       throw new Error(`Invalid model format: ${resolvedModel}. Expected "provider:model".`);
     }
-    this.provider = resolvedModel.slice(0, idx);
+    this.provider = _normalizeGatewayProvider(resolvedModel.slice(0, idx));
     this.model = resolvedModel.slice(idx + 1);
-    this._boundSpec = resolvedModel;
+    this._boundSpec = `${this.provider}:${this.model}`;
     this.base_url = this._factoryBaseUrl;
     this.api_key = this._factoryApiKey;
     if (this.proxy && this.base_url == null) this.base_url = this.proxy;
@@ -967,7 +989,7 @@ Respond with:
         const widx = wideModelSpec.indexOf(':');
         const wideProvider =
           widx > 0 && widx < wideModelSpec.length - 1
-            ? wideModelSpec.slice(0, widx)
+            ? _normalizeGatewayProvider(wideModelSpec.slice(0, widx))
             : null;
         this._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
         this._wideClient = wideProvider ? PROVIDERS[wideProvider] : this.client;
