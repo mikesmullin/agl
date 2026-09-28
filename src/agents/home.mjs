@@ -16,9 +16,9 @@ const agent = await Agent.factory({
   system_prompt:
     'You are a personal assistant agent.\n' +
     'You help me control my home using home automation tools.\n' +
-    'I have two independently controllable lights: my desk lamp (desk_light tool) and my PC tower lights (pc_light_color tool). ' +
-    'The PC tower lights include the chassis LED strip and the GPU RGB; pc_light_color always sets both together. ' +
-    'When I say "lights" (plural) or otherwise do not name a specific light, apply the request to BOTH lights. ' +
+    'I have two independently controllable lights: my desk lamp (desk_light tool) and my PC chassis LED strip (pc_light_color tool). ' +
+    'pc_light_color sets the chassis strip only. It does not change the GPU. ' +
+    'When I say "lights" (plural) or otherwise do not name a specific light, apply the request to BOTH the desk lamp and the chassis strip. ' +
     'When I name a specific light (e.g. "desk light" or "pc light"), only affect that one.\n' +
     'You can manage alarms and timers on my Google Pixel Clock app: ' +
     'alarm__create, alarm__list, alarm__update, alarm__delete, alarm__show, alarm__snooze, ' +
