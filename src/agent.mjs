@@ -1171,9 +1171,12 @@ Respond with:
         output_tool?.parameters || { output: { type: output_tool?.type } },
         output_tool?.required || ['output'],
         outFn);
-      if (!inst.tool_choice) {
-        inst.tool_choice = 'required';
-      }
+      // No default tool_choice: when unspecified, omit the field and let
+      // the server decide. (Historically defaulted to 'required' for xAI;
+      // most providers today succeed without it, and NInfer rejects it.)
+      // if (!inst.tool_choice) {
+      //   inst.tool_choice = 'required';
+      // }
     }
 
     return inst;
