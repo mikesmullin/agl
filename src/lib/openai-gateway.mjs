@@ -1,5 +1,5 @@
 /**
- * Shared helpers for OpenAI-compatible provider passthrough (dad-proxy / Agent.chatCompletions).
+ * Shared helpers for OpenAI-compatible provider passthrough (local-proxy / Agent.chatCompletions).
  * inference() for Agent.run() stays provider-local; these return raw fetch Responses.
  */
 

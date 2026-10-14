@@ -6,12 +6,13 @@ import * as ollama from './providers/ollama.mjs';
 import * as lmstudio from './providers/lm-studio.mjs';
 import * as runpod from './providers/runpod.mjs';
 import * as meta from './providers/meta.mjs';
-import * as mycloud from './providers/mycloud.mjs';
 import * as openai from './providers/openai.mjs';
 import * as anthropic from './providers/anthropic.mjs';
 import { openaiErrorResponse } from './lib/openai-gateway.mjs';
 import {
   readUserDefaultModel,
+  readUserEndpoints,
+  readUserEndpointsSync,
   readUserConfigSync,
   userConfigPath,
 } from './lib/config.mjs';
@@ -47,17 +48,20 @@ const PROVIDERS = {
   meta,
   // Legacy alias for Meta Muse API
   muse: meta,
-  mycloud,
-  'llama-server': mycloud,
+  // Generic OpenAI-compatible client (endpoint from the `endpoints` config
+  // map). The old `mycloud` provider module was RENAMED into it — `mycloud`
+  // is now a DYNAMIC provider name (the psicom mycloud AI gateway), resolved
+  // via the map, not a built-in.
+  'llama-server': openai,
   openai,
   anthropic,
 };
 
 /**
  * Local llama.cpp (`llama-server:`), not the remote mycloud VM.
- * `llama-server` shares the mycloud provider module, so without this override
- * it would inherit MYCLOUD_BASE_URL (GCE). Gateway and Agent.factory both
- * bind it to localhost unless LLAMA_SERVER_BASE_URL is set.
+ * `llama-server` shares the generic openai-compatible module, so without this
+ * override it would inherit MYCLOUD_BASE_URL (GCE). Gateway and Agent.factory
+ * both bind it to localhost unless LLAMA_SERVER_BASE_URL is set.
  */
 function _llamaServerEndpoint() {
   return {
@@ -66,8 +70,45 @@ function _llamaServerEndpoint() {
   };
 }
 
+/** 'local-proxy' → 'LOCAL_PROXY' — the `<UPPER>_API_KEY` / `<UPPER>_CA_FILE` env convention. */
+function _envStem(provider) {
+  return String(provider).toUpperCase().replace(/-/g, '_');
+}
+
+/** Substitute `{{model}}` in an endpoint URL via the in-house mini-handlebars. */
+function _templateEndpoint(url, model) {
+  return String(applyLocals(String(url ?? ''), { model: String(model ?? '') })).trim();
+}
+
 /**
- * OpenAI-compatible gateway (dad-proxy). `host:port` becomes `https://host:port`.
+ * Per-request endpoint extras for the OpenAI-compatible passthrough handlers:
+ * the `endpoints` map entry (dynamic providers), else the llama-server /
+ * hosted-openai built-in bindings, else {}.
+ */
+function _endpointExtra(provider, model) {
+  const ep = readUserEndpointsSync()[provider];
+  if (ep) {
+    const url = typeof ep === 'string' ? ep : ep.url;
+    const stem = _envStem(provider);
+    const extra = { base_url: _templateEndpoint(url, model) };
+    const key =
+      typeof ep === 'object' && Object.prototype.hasOwnProperty.call(ep, 'api_key')
+        ? String(ep.api_key ?? '')
+        : process.env[`${stem}_API_KEY`] || '';
+    if (key) extra.api_key = key;
+    const cf = (typeof ep === 'object' && ep.ca_file) || process.env[`${stem}_CA_FILE`];
+    if (cf) extra.ca_file = String(cf);
+    return extra;
+  }
+  if (provider === 'llama-server') return _llamaServerEndpoint();
+  if (provider === 'openai') {
+    return { base_url: process.env.OPENAI_BASE_URL || 'https://api.openai.com' };
+  }
+  return {};
+}
+
+/**
+ * OpenAI-compatible gateway (local-proxy). `host:port` becomes `https://host:port`.
  * A full URL is kept (trailing `/v1` stripped). Empty / null → no proxy.
  * @param {unknown} proxy
  * @returns {string}
@@ -129,8 +170,14 @@ function _splitProviderModel(spec) {
 export function resolveContextWindow(spec, opts = {}) {
   const fallback =
     Number.isFinite(opts.default) && opts.default > 0 ? opts.default : 32_768;
-  if (!spec) return fallback;
-  const { provider, model } = _splitProviderModel(spec);
+  let s = spec;
+  // The bare word `default` (provider omitted) resolves through `default_model`.
+  if (String(s ?? '').trim() === 'default') {
+    const d = readUserConfigSync().default_model;
+    s = d && String(d).trim() !== 'default' ? d : FALLBACK_DEFAULT_MODEL;
+  }
+  if (!s) return fallback;
+  const { provider, model } = _splitProviderModel(s);
   const n = _lookupContextWindow(provider, model);
   return n != null ? n : fallback;
 }
@@ -201,7 +248,7 @@ function _normalizeGatewayProvider(name) {
 }
 
 /**
- * OpenAI-compatible chat completions passthrough for gateways (dad-proxy).
+ * OpenAI-compatible chat completions passthrough for gateways (local-proxy).
  * Returns a fetch Response (SSE when body.stream). Does not run the agent loop.
  *
  * @param {object} body OpenAI chat.completions request body (`model` is provider:model)
@@ -215,7 +262,11 @@ export async function chatCompletions(body, { signal } = {}) {
   if (!Array.isArray(body.messages)) {
     return openaiErrorResponse(400, '`messages` array is required', 'missing_messages');
   }
-  const raw = _blankModel(body.model) ? await resolveDefaultModel() : String(body.model).trim();
+  let raw = _blankModel(body.model) ? await resolveDefaultModel() : String(body.model).trim();
+  if (raw === 'default') {
+    const sub = await resolveDefaultModel();
+    raw = sub && String(sub).trim() !== 'default' ? String(sub).trim() : '';
+  }
   if (!raw) {
     return openaiErrorResponse(
       400,
@@ -229,7 +280,7 @@ export async function chatCompletions(body, { signal } = {}) {
   if (!mod) {
     return openaiErrorResponse(
       400,
-      `Unknown provider "${provider}". Use one of: ${Object.keys(PROVIDERS).join(', ')}. Model format: provider:model`,
+      `Unknown provider "${provider}". Known: ${Object.keys(PROVIDERS).join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}. Model format: provider:model`,
       'unknown_provider',
     );
   }
@@ -249,7 +300,7 @@ export async function chatCompletions(body, { signal } = {}) {
       err.code || 'init_error',
     );
   }
-  const extra = provider === 'llama-server' ? _llamaServerEndpoint() : {};
+  const extra = _endpointExtra(provider, model);
   try {
     return await mod.chatCompletionsRequest({
       model,
@@ -300,7 +351,11 @@ export async function embeddingsRequest(body, { signal } = {}) {
   if (!body || body.input == null) {
     return openaiErrorResponse(400, '`input` is required', 'missing_input');
   }
-  const raw = _blankModel(body.model) ? await resolveDefaultModel() : String(body.model).trim();
+  let raw = _blankModel(body.model) ? await resolveDefaultModel() : String(body.model).trim();
+  if (raw === 'default') {
+    const sub = await resolveDefaultModel();
+    raw = sub && String(sub).trim() !== 'default' ? String(sub).trim() : '';
+  }
   if (!raw) {
     return openaiErrorResponse(
       400,
@@ -312,7 +367,7 @@ export async function embeddingsRequest(body, { signal } = {}) {
   provider = _normalizeGatewayProvider(provider);
   const mod = PROVIDERS[provider];
   if (!mod) {
-    return openaiErrorResponse(400, `Unknown provider "${provider}"`, 'unknown_provider');
+    return openaiErrorResponse(400, `Unknown provider "${provider}" — or add it to the \`endpoints\` map in ${userConfigPath()}`, 'unknown_provider');
   }
   if (typeof mod.embeddingsRequest !== 'function' && typeof mod.embeddings !== 'function') {
     return openaiErrorResponse(
@@ -330,7 +385,7 @@ export async function embeddingsRequest(body, { signal } = {}) {
       err.code || 'init_error',
     );
   }
-  const extra = provider === 'llama-server' ? _llamaServerEndpoint() : {};
+  const extra = _endpointExtra(provider, model);
   try {
     if (typeof mod.embeddingsRequest === 'function') {
       return await mod.embeddingsRequest({
@@ -942,7 +997,19 @@ Respond with:
    * @param {string} spec `provider:model`
    */
   async _bindModel(spec) {
-    const resolvedModel = String(spec || '').trim();
+    let resolvedModel = String(spec || '').trim();
+    // The bare word `default` (provider omitted) resolves through
+    // `default_model` in the user config — re-read on every bind so a disk
+    // edit takes effect without restarting the process (AGL convention).
+    if (resolvedModel === 'default') {
+      const sub = await resolveDefaultModel();
+      if (!sub || String(sub).trim() === 'default') {
+        throw new Error(
+          `The bare model word "default" requires a concrete ${userConfigPath()} default_model (e.g. default_model: local:default); the file's default_model may not itself be the word "default".`,
+        );
+      }
+      resolvedModel = String(sub).trim();
+    }
     if (!resolvedModel) {
       throw new Error(
         `Agent.factory requires model or ${userConfigPath()} default_model`,
@@ -950,7 +1017,7 @@ Respond with:
     }
     const idx = resolvedModel.indexOf(':');
     if (idx <= 0 || idx >= resolvedModel.length - 1) {
-      throw new Error(`Invalid model format: ${resolvedModel}. Expected "provider:model".`);
+      throw new Error(`Invalid model format: ${resolvedModel}. Expected "provider:model" (or the bare word "default").`);
     }
     this.provider = _normalizeGatewayProvider(resolvedModel.slice(0, idx));
     this.model = resolvedModel.slice(idx + 1);
@@ -962,16 +1029,50 @@ Respond with:
       this.client = PROVIDERS['llama-server'];
       this.model = resolvedModel;
     } else {
-      this.client = PROVIDERS[this.provider];
-      if (!this.client) {
-        throw new Error(
-          `Unknown AI provider: ${this.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`,
-        );
-      }
-      if (this.provider === 'llama-server') {
-        const local = _llamaServerEndpoint();
-        if (this.base_url == null) this.base_url = local.base_url;
-        if (this.api_key == null) this.api_key = local.api_key;
+      // Dynamic `endpoints` map first (config.yaml: provider_name → endpoint).
+      // Any key in the map routes through the generic openai-compatible
+      // client; `<UPPER>_API_KEY` / `<UPPER>_CA_FILE` envs supply credentials.
+      const ep = (await readUserEndpoints())[this.provider];
+      if (ep) {
+        this.client = PROVIDERS.openai;
+        if (this.base_url == null) {
+          const url = typeof ep === 'string' ? ep : ep.url;
+          this.base_url = _templateEndpoint(url, this.model);
+        }
+        if (this.api_key == null) {
+          const stem = _envStem(this.provider);
+          const kFromMap =
+            typeof ep === 'object' && typeof ep.api_key === 'string'
+              ? ep.api_key
+              : null;
+          this.api_key =
+            kFromMap !== null ? kFromMap : process.env[`${stem}_API_KEY`] || '';
+        }
+        if (!this.ca_file) {
+          const stem = _envStem(this.provider);
+          const cf =
+            (typeof ep === 'object' && ep.ca_file) ||
+            process.env[`${stem}_CA_FILE`] ||
+            null;
+          if (cf) this.ca_file = String(cf);
+        }
+      } else {
+        this.client = PROVIDERS[this.provider];
+        if (!this.client) {
+          throw new Error(
+            `Unknown AI provider: ${this.provider}. Known: ${Object.keys(PROVIDERS).join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}.`,
+          );
+        }
+        if (this.provider === 'llama-server') {
+          const local = _llamaServerEndpoint();
+          if (this.base_url == null) this.base_url = local.base_url;
+          if (this.api_key == null) this.api_key = local.api_key;
+        } else if (this.provider === 'openai') {
+          // Hosted OpenAI fallback when the map has no `openai` entry.
+          if (this.base_url == null) {
+            this.base_url = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
+          }
+        }
       }
     }
     await this.client.init({
@@ -1046,7 +1147,7 @@ Respond with:
     base_url,
     api_key,
     ca_file,
-    // OpenAI-compatible gateway (dad-proxy). When set, ANY `provider:model`
+    // OpenAI-compatible gateway (local-proxy). When set, ANY `provider:model`
     // is POSTed to this endpoint (model id kept as `provider:model`).
     // `host:port` → https://host:port; a full URL is kept. Still pass
     // api_key / ca_file for HTTPS. Does not use native xAI/Anthropic/… clients.
@@ -1171,12 +1272,9 @@ Respond with:
         output_tool?.parameters || { output: { type: output_tool?.type } },
         output_tool?.required || ['output'],
         outFn);
-      // No default tool_choice: when unspecified, omit the field and let
-      // the server decide. (Historically defaulted to 'required' for xAI;
-      // most providers today succeed without it, and NInfer rejects it.)
-      // if (!inst.tool_choice) {
-      //   inst.tool_choice = 'required';
-      // }
+      if (!inst.tool_choice) {
+        inst.tool_choice = 'required';
+      }
     }
 
     return inst;

@@ -1,2 +1,3 @@
-# Lets Bun import shared .coffee tools from /workspace/agl-common.
-preload = ["/workspace/agl-common/node_modules/bun-coffeescript/register"]
+# Lets Bun import shared .coffee tools from /workspace/agl-common (container).
+# Tolerant shim: skips gracefully when the container path doesn't exist.
+preload = ["./preload.mjs"]

@@ -6,6 +6,7 @@ import * as config from '../lib/config.mjs';
 import { openaiErrorFromResponse } from '../lib/openai-gateway.mjs';
 
 let _key = '';
+let _workspaceId = '';
 const _baseUrl = 'https://api.anthropic.com';
 const _defaultModel = 'claude-sonnet-4-5';
 
@@ -16,6 +17,7 @@ export async function init() {
     err.code = 'MISSING_ANTHROPIC_API_KEY';
     throw err;
   }
+  _workspaceId = process.env.ANTHROPIC_WORKSPACE_ID || '';
 }
 
 export function defaultModel() {
@@ -362,6 +364,7 @@ export async function chatCompletionsRequest({ model, body, signal } = {}) {
       'Content-Type': 'application/json',
       'x-api-key': _key,
       'anthropic-version': '2023-06-01',
+      ...(_workspaceId ? { 'anthropic-workspace-id': _workspaceId } : {}),
     },
     body: JSON.stringify(payload),
     signal,

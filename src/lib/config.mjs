@@ -130,6 +130,26 @@ export async function readUserDefaultModel() {
   return s || null;
 }
 
+/**
+ * `endpoints` map from the user config: provider_name → OpenAI-compatible
+ * endpoint URL (string, may carry a `{{model}}` handlebars placeholder) or a
+ * one-level object `{ url, api_key?, ca_file? }`. Dynamic provider names —
+ * any key here routes through the generic openai-compatible provider.
+ */
+export async function readUserEndpoints() {
+  return _endpointsOf(await readUserConfig());
+}
+
+/** Sync counterpart (no network, no cache). */
+export function readUserEndpointsSync() {
+  return _endpointsOf(readUserConfigSync());
+}
+
+function _endpointsOf(cfg) {
+  const e = cfg?.endpoints;
+  return e && typeof e === 'object' && !Array.isArray(e) ? e : {};
+}
+
 export async function read(var_name) {
   return process.env[var_name] || null;
 }
