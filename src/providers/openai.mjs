@@ -218,7 +218,21 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
   });
   console.error(`[openai] ${response.status} ${response.statusText}`);
   if (errorBody) console.error(`[openai] response body: ${errorBody}`);
-  const err = new Error(`openai-compatible request error: ${response.status} ${response.statusText}`);
+  // Surface the server's own code/message in the Error text (not just status):
+  // harnesses match on it (vision_disabled vs context_length_exceeded) and
+  // the session log would otherwise swallow the only useful diagnostic.
+  let detail = '';
+  try {
+    const parsed = JSON.parse(errorBody);
+    const code = parsed?.error?.code ?? parsed?.code;
+    const message = parsed?.error?.message ?? parsed?.message;
+    if (code || message) {
+      detail = ` (${[code, message].filter(Boolean).join(': ')}`.slice(0, 300) + ')';
+    }
+  } catch {
+    if (errorBody) detail = ` (${errorBody.slice(0, 200)})`;
+  }
+  const err = new Error(`openai-compatible request error: ${response.status} ${response.statusText}${detail}`);
   err.status = response.status;
   err.body = errorBody;
   throw err;

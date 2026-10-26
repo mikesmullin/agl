@@ -604,6 +604,61 @@ function _newCtxId() {
 }
 
 /**
+ * Image budget for outgoing provider requests (pi-image-guard trick).
+ *
+ * Screenshot-heavy turns can stack dozens of image blocks into one request:
+ * servers cap that (vLLM: 20 images; vision-less servers: 0). This keeps the
+ * newest `keep` image blocks across ALL messages — several screenshot tools
+ * share one budget — and replaces older blocks with a short text placeholder.
+ * Message order, tool_call_id links and text are untouched; the stored
+ * context_window is never mutated (eviction applies to the outgoing copy).
+ *
+ * Handles both Pi-style `{type:'image'}` blocks and OpenAI-style
+ * `{type:'image_url', image_url:{url}}` blocks (what AGL itself emits for
+ * tool results). `keep: 0` strips every image (vision-less servers).
+ */
+export const IMAGE_BUDGET_MAX = 1000;
+export const IMAGE_OMITTED_NOTICE =
+  '[Older image omitted from this request to stay within the image budget; original remains in session history. Reread or reattach it if needed.]';
+
+function _isImageBlock(block) {
+  if (!block || typeof block !== 'object') return false;
+  if (block.type === 'image') return true;
+  if (block.type === 'image_url' && block.image_url != null) return true;
+  return false;
+}
+
+export function pruneImageBlocks(messages, keep) {
+  const n =
+    keep != null && Number.isFinite(Number(keep))
+      ? Math.max(0, Math.floor(Number(keep)))
+      : null;
+  if (n == null) return messages;
+  let total = 0;
+  for (const m of messages || []) {
+    if (!m || typeof m !== 'object' || !Array.isArray(m.content)) continue;
+    for (const block of m.content) if (_isImageBlock(block)) total++;
+  }
+  const over = total - Math.min(n, IMAGE_BUDGET_MAX);
+  if (over <= 0) return messages;
+  let remaining = over;
+  return (messages || []).map((m) => {
+    if (remaining <= 0 || !m || typeof m !== 'object' || !Array.isArray(m.content))
+      return m;
+    let changed = false;
+    const content = m.content.map((block) => {
+      if (remaining > 0 && _isImageBlock(block)) {
+        remaining--;
+        changed = true;
+        return { type: 'text', text: IMAGE_OMITTED_NOTICE };
+      }
+      return block;
+    });
+    return changed ? { ...m, content } : m;
+  });
+}
+
+/**
  * Strip harness-only fields; produce OpenAI / LM Studio chat.completions message.
  *
  * Canonical schema (see tmp/scrratchpad4.md + OpenAI chat completions):
@@ -717,7 +772,11 @@ export default class Agent {
     if (typeof fn !== 'function') {
       throw new Error(`Tool ${name}: handler is not a function`);
     }
-    if (Object.keys(this.tools).length >= 128) throw new Error('Tool limit exceeded: maximum 128 tools allowed');
+    const maxTools = this.max_tools ?? 256;
+    if (!Number.isSafeInteger(maxTools) || maxTools < 1) throw new Error('max_tools must be a positive integer');
+    if (!Object.hasOwn(this.tools, name) && Object.keys(this.tools).length >= maxTools) {
+      throw new Error(`Tool limit exceeded: maximum ${maxTools} tools allowed`);
+    }
     fn._name = name;
     fn._description = description || '';
     fn._properties = properties || {};
@@ -1138,6 +1197,11 @@ Respond with:
     // over AGL_RETRY_ATTEMPTS when a caller (e.g. brain viz) needs cancel to
     // stick and must not re-fire a stuck inference loop.
     retries,
+    // Image budget: newest N image blocks kept per provider request (older
+    // become a text placeholder; 0 = strip all — vision-less servers).
+    // null/omitted = unlimited (historical behavior). Also readable from
+    // Agent.default.max_images.
+    max_images,
     // Per-attempt wall-clock timeout (ms). Overrides AGL_TIMEOUT_MS for this agent.
     timeout_ms,
     // Per-agent provider endpoint / credential overrides (mycloud / llama-server).
@@ -1170,6 +1234,16 @@ Respond with:
           : Number(Agent.default.max_turns ?? 5);
       inst.max_turns =
         Number.isFinite(mt) && mt >= 1 ? Math.floor(mt) : 5;
+    }
+
+    // Image budget (pi-image-guard trick, newest-N-wins). null = unlimited.
+    {
+      const raw = max_images ?? Agent.default.max_images ?? null;
+      const mi = raw == null ? null : Number(raw);
+      inst.max_images =
+        mi == null || !Number.isFinite(mi)
+          ? null
+          : Math.max(0, Math.min(IMAGE_BUDGET_MAX, Math.floor(mi)));
     }
 
     // Token budget (was historically named context_window as a number).
@@ -1389,6 +1463,9 @@ Respond with:
       }
       out.push(row);
     }
+    // Image budget: keep newest N image blocks, omit older ones (placeholder).
+    // Stored context_window is untouched — eviction applies to this request.
+    if (this.max_images != null) return pruneImageBlocks(out, this.max_images);
     return out;
   }
 
