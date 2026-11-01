@@ -1,4 +1,4 @@
-//! Agent — port of `js/src/agent.mjs` (the inference path and `switch()`).
+//! Agent — port of `src/agent.mjs` (the inference path and `switch()`).
 //!
 //! Provider resolution follows the JS original exactly, including the parts
 //! that look odd: a deprecated id stays VISIBLE as `agent.provider` so its
