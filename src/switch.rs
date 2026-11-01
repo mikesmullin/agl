@@ -774,10 +774,6 @@ pub fn run_switch(
     })
 }
 
-// BENCH_EDIT_MARKER — rewritten by bench/compile-bench.sh; harmless.
-#[doc(hidden)]
-pub fn __bench_probe() -> u64 { 0 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
