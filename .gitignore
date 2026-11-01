@@ -1,1 +1,5 @@
-/target/
+target/
+
+# Local notes and the Blaze regression probes — kept on disk, out of the branch.
+/PORT_STATUS.md
+/blaze-probes/
