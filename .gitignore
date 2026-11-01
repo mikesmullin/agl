@@ -4,3 +4,5 @@ node_modules/
 .copilot_tokens.json
 src/agents/*
 /tmp/
+# Local planning notes — kept on disk, out of the branch.
+/PLAN.md

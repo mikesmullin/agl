@@ -34,15 +34,23 @@ context_windows:
     grok-4.6: 500000
     grok-4.5: 131072
     grok-4-0709: 131072
+  generic:
+    default: 262144
+    qwen-3.8-27b: 262144
 `;
 
 describe('resolveContextWindow', () => {
   test('reads provider → model sizes from the user config', () => {
     writeConfig(WINDOWS_YAML);
+    // A provider name that is no longer built in (xai moved to the
+    // `endpoints` map) still resolves its own context_windows group.
     expect(resolveContextWindow('xai:grok-4.6')).toBe(500_000);
-    expect(resolveContextWindow('grok-4.6')).toBe(500_000);
     expect(resolveContextWindow('xai:grok-4.5')).toBe(131_072);
     expect(resolveContextWindow('xai:grok-4-0709')).toBe(131_072);
+    // A bare model id now routes to `generic` (the old grok -> xai and
+    // catch-all -> lm-studio guesses went away with those providers).
+    expect(resolveContextWindow('qwen-3.8-27b')).toBe(262_144);
+    expect(resolveContextWindow('grok-4.6')).toBe(262_144);
   });
 
   test('llama-server lookup does not contact MYCLOUD_BASE_URL', async () => {
@@ -81,7 +89,7 @@ describe('normalizeProxy', () => {
 });
 
 describe('Agent.factory({ proxy })', () => {
-  test('routes any provider:model through the llama-server OpenAI client', async () => {
+  test('routes any provider:model through the generic OpenAI client', async () => {
     const agent = await Agent.factory({
       model: 'xai:grok-4.6',
       proxy: 'host.containers.internal:1234',
@@ -91,8 +99,9 @@ describe('Agent.factory({ proxy })', () => {
     expect(agent.base_url).toBe('https://host.containers.internal:1234');
     expect(agent.provider).toBe('xai');
     expect(agent.model).toBe('xai:grok-4.6');
-    expect(agent.client).toBe(providers['llama-server']);
-    expect(agent.client).not.toBe(providers.xai);
+    expect(agent.client).toBe(providers.generic);
+    // xai is not a built-in any more, yet the proxy still routes it.
+    expect(providers.xai).toBeUndefined();
   });
 
   test('does not require AGL to know the provider', async () => {
@@ -102,7 +111,7 @@ describe('Agent.factory({ proxy })', () => {
       api_key: 'k',
     });
     expect(agent.model).toBe('acme:secret-model');
-    expect(agent.client).toBe(providers['llama-server']);
+    expect(agent.client).toBe(providers.generic);
   });
 
   test('base_url wins as the fetch URL when both are set', async () => {
@@ -115,7 +124,7 @@ describe('Agent.factory({ proxy })', () => {
     expect(agent.proxy).toBe('https://host.containers.internal:1234');
     expect(agent.base_url).toBe('https://dad.example:1234');
     expect(agent.model).toBe('openai:gpt-4o');
-    expect(agent.client).toBe(providers['llama-server']);
+    expect(agent.client).toBe(providers.generic);
   });
 
   test('without proxy, unknown provider still throws', async () => {

@@ -74,10 +74,10 @@ describe('Agent.factory empty model', () => {
 
   test('explicit model is not live-default', async () => {
     writeConfig('default_model: llama-server:gemma-4-12b-qat\n');
-    const agent = await Agent.factory({ model: 'xai:grok-4.6' });
+    const agent = await Agent.factory({ model: 'generic:qwen-3.8-27b' });
     expect(agent._liveDefault).toBe(false);
-    expect(agent.provider).toBe('xai');
-    expect(agent.model).toBe('grok-4.6');
+    expect(agent.provider).toBe('generic');
+    expect(agent.model).toBe('qwen-3.8-27b');
   });
 });
 

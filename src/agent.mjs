@@ -1,14 +1,9 @@
 import { debug } from './lib/debug.mjs';
 import { applyLocals } from './lib/mini-handlebars.mjs';
-import * as xai from './providers/xai.mjs';
 import * as copilot from './providers/copilot.mjs';
-import * as ollama from './providers/ollama.mjs';
-import * as lmstudio from './providers/lm-studio.mjs';
-import * as runpod from './providers/runpod.mjs';
-import * as meta from './providers/meta.mjs';
-import * as openai from './providers/openai.mjs';
-import * as anthropic from './providers/anthropic.mjs';
+import * as generic from './providers/generic.mjs';
 import { openaiErrorResponse } from './lib/openai-gateway.mjs';
+import { runSwitch, pick, formatTrace, parseTrace } from './switch.mjs';
 import {
   readUserDefaultModel,
   readUserEndpoints,
@@ -39,23 +34,69 @@ export async function resolveDefaultModel() {
 
 export { userConfigPath };
 
+/**
+ * Built-in providers. Three canonical ids:
+ *
+ *   generic  — the OpenAI-compatible client. Endpoint comes from the
+ *              `endpoints` config map, a per-agent `base_url`, or the
+ *              MYCLOUD_/LLAMA_SERVER_/OPENAI_ env chain. Any provider name in
+ *              the `endpoints` map routes here, so a new OpenAI-compatible
+ *              backend needs config, not code. Non-conforming servers are
+ *              described with endpoint QUIRKS (see _quirksFromEntry), not
+ *              with a bespoke module.
+ *   copilot  — GitHub Copilot. The one genuine exception: device-flow auth
+ *              and token exchange, not just a different base URL.
+ *
+ * The xai, ollama, lm-studio, runpod, anthropic and meta modules were all
+ * removed. The first five were plain OpenAI-compatible endpoints; `meta` was
+ * too, apart from two quirks now expressed in config (anthropic's native
+ * Messages shape was the only real exception, and it had no callers left).
+ */
 const PROVIDERS = {
-  xai,
+  generic,
   copilot,
-  ollama,
-  'lm-studio': lmstudio,
-  runpod,
-  meta,
-  // Legacy alias for Meta Muse API
-  muse: meta,
-  // Generic OpenAI-compatible client (endpoint from the `endpoints` config
-  // map). The old `mycloud` provider module was RENAMED into it — `mycloud`
-  // is now a DYNAMIC provider name (the psicom mycloud AI gateway), resolved
-  // via the map, not a built-in.
-  'llama-server': openai,
-  openai,
-  anthropic,
 };
+
+/**
+ * Deprecated provider ids kept as aliases so existing `default_model` configs
+ * and `provider:model` strings keep resolving. Canonical id on the right.
+ *
+ * `llama-server` and `openai` were never separate modules — both already
+ * pointed at the generic OpenAI-compatible client and only differed in which
+ * endpoint they defaulted to (localhost vs api.openai.com). That defaulting is
+ * preserved in _bindDefaultModel / _endpointExtra, so the aliases behave
+ * exactly as before.
+ */
+const PROVIDER_ALIASES = {
+  'llama-server': 'generic',
+  openai: 'generic',
+  // The System One decision slot. Same OpenAI-compatible client, different
+  // route (/v1/systemone) and a different default port — see
+  // _systemOneEndpoint. Chat calls against it will fail, by design.
+  systemone: 'generic',
+  // Meta Muse: the module is gone; the id now binds `generic` plus the
+  // built-in meta endpoint + quirks (_metaEndpoint).
+  meta: 'generic',
+  muse: 'generic',
+};
+
+/** Canonical provider id for a possibly-aliased name. */
+function resolveProviderId(name) {
+  const n = String(name ?? '');
+  return Object.prototype.hasOwnProperty.call(PROVIDER_ALIASES, n)
+    ? PROVIDER_ALIASES[n]
+    : n;
+}
+
+/** Provider module for a possibly-aliased name (undefined when unknown). */
+function providerModule(name) {
+  return PROVIDERS[resolveProviderId(name)];
+}
+
+/** Every accepted provider id (canonical + aliases), for error messages. */
+function knownProviderIds() {
+  return [...Object.keys(PROVIDERS), ...Object.keys(PROVIDER_ALIASES)];
+}
 
 /**
  * Local llama.cpp (`llama-server:`), not the remote mycloud VM.
@@ -68,6 +109,66 @@ function _llamaServerEndpoint() {
     base_url: process.env.LLAMA_SERVER_BASE_URL || 'http://127.0.0.1:1234',
     api_key: process.env.LLAMA_SERVER_API_KEY || '',
   };
+}
+
+/**
+ * System One decision slot (`systemone:`), the counterpart of `llama-server:`
+ * for decision models. Honours SYSTEMONE_URL — the same env var the inference
+ * launcher uses — and falls back to the documented :1237 default.
+ *
+ * Marked `decisions: true` so binding a decision_model to it needs no config.
+ */
+function _systemOneEndpoint() {
+  return {
+    base_url: process.env.SYSTEMONE_URL || 'http://127.0.0.1:1237',
+    api_key: process.env.SYSTEMONE_API_KEY || '',
+    quirks: { decisions: true },
+  };
+}
+
+/**
+ * Meta Muse. The dedicated `meta` provider module was COLLAPSED into the
+ * generic OpenAI-compatible client: its wire format, auth header and routes
+ * were already identical. The only two real differences are expressed as
+ * endpoint QUIRKS instead of code:
+ *   - tool_choice: Muse accepts only "auto" and rejects "required"/"none"/{...}
+ *   - stream:      the old module had no streaming path, so don't start one
+ * An `endpoints.meta` entry in the user config overrides any of this.
+ */
+function _metaEndpoint() {
+  return {
+    base_url: process.env.META_BASE_URL || 'https://api.meta.ai',
+    api_key: process.env.META_API_KEY || process.env.MUSE_API_KEY || '',
+    quirks: {
+      tool_choice: 'auto',
+      stream: false,
+    },
+  };
+}
+
+/**
+ * Per-endpoint behaviour flags, read from the object form of an `endpoints`
+ * entry. These let a non-conforming OpenAI-compatible server be described in
+ * config instead of in a bespoke provider module.
+ *
+ *   endpoints:
+ *     meta:
+ *       url: https://api.meta.ai
+ *       tool_choice: auto      # coerce every request to this value
+ *       stream: false          # never send stream:true
+ *       decisions: true        # native /v1/systemone decision endpoint
+ *
+ * There is deliberately no `default_model` quirk: a model id is required by
+ * the `provider:model` format check long before a quirk could fill it, and
+ * the config's top-level `default_model:` already covers that need.
+ */
+function _quirksFromEntry(ep) {
+  if (!ep || typeof ep !== 'object') return undefined;
+  const q = {};
+  if (ep.tool_choice !== undefined) q.tool_choice = ep.tool_choice;
+  if (ep.stream !== undefined) q.stream = Boolean(ep.stream);
+  if (ep.decisions !== undefined) q.decisions = Boolean(ep.decisions);
+  return Object.keys(q).length ? q : undefined;
 }
 
 /** 'local-proxy' → 'LOCAL_PROXY' — the `<UPPER>_API_KEY` / `<UPPER>_CA_FILE` env convention. */
@@ -98,13 +199,25 @@ function _endpointExtra(provider, model) {
     if (key) extra.api_key = key;
     const cf = (typeof ep === 'object' && ep.ca_file) || process.env[`${stem}_CA_FILE`];
     if (cf) extra.ca_file = String(cf);
+    // A config entry wins over any built-in quirk set for the same name.
+    const q = _quirksFromEntry(ep) ?? _builtinEndpoint(provider)?.quirks;
+    if (q) extra.quirks = q;
     return extra;
   }
+  const builtin = _builtinEndpoint(provider);
+  if (builtin) return builtin;
+  return {};
+}
+
+/** Built-in endpoint bindings for the deprecated/collapsed provider ids. */
+function _builtinEndpoint(provider) {
   if (provider === 'llama-server') return _llamaServerEndpoint();
   if (provider === 'openai') {
     return { base_url: process.env.OPENAI_BASE_URL || 'https://api.openai.com' };
   }
-  return {};
+  if (provider === 'meta') return _metaEndpoint();
+  if (provider === 'systemone') return _systemOneEndpoint();
+  return null;
 }
 
 /**
@@ -146,10 +259,12 @@ function _splitProviderModel(spec) {
       m.includes('fable')
     ) {
       provider = 'copilot';
-    } else if (m.includes('grok')) {
-      provider = 'xai';
     } else {
-      provider = 'lm-studio';
+      // Everything else goes to the OpenAI-compatible client, which resolves
+      // its endpoint from the `endpoints` map / env chain. (The old `grok`
+      // -> xai and catch-all -> lm-studio branches went away with those
+      // providers; both are reachable as `endpoints` entries.)
+      provider = 'generic';
     }
   }
   return { provider, model };
@@ -239,8 +354,17 @@ function _lookupContextWindow(provider, model) {
 /** Provider modules (for tests / advanced callers). */
 export { PROVIDERS as providers };
 
+/** switch() helpers — `pick` builds a choice question from a list of options. */
+export { pick, formatTrace, parseTrace, runSwitch } from './switch.mjs';
+
+/**
+ * Normalize alternate SPELLINGS of a provider name. Deliberately does NOT
+ * collapse the deprecated `llama-server` / `openai` aliases: those stay
+ * visible as `agent.provider` so their endpoint defaults and their
+ * `context_windows` config groups keep resolving. Module lookup goes through
+ * providerModule(), which understands the aliases.
+ */
 function _normalizeGatewayProvider(name) {
-  if (name === 'lmstudio') return 'lm-studio';
   if (name === 'github' || name === 'github-copilot') return 'copilot';
   // Canonical provider id is `meta`; keep `muse` as a legacy alias.
   if (name === 'muse') return 'meta';
@@ -276,11 +400,11 @@ export async function chatCompletions(body, { signal } = {}) {
   }
   let { provider, model } = _splitProviderModel(raw);
   provider = _normalizeGatewayProvider(provider);
-  const mod = PROVIDERS[provider];
+  const mod = providerModule(provider);
   if (!mod) {
     return openaiErrorResponse(
       400,
-      `Unknown provider "${provider}". Known: ${Object.keys(PROVIDERS).join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}. Model format: provider:model`,
+      `Unknown provider "${provider}". Known: ${knownProviderIds().join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}. Model format: provider:model`,
       'unknown_provider',
     );
   }
@@ -365,7 +489,7 @@ export async function embeddingsRequest(body, { signal } = {}) {
   }
   let { provider, model } = _splitProviderModel(raw);
   provider = _normalizeGatewayProvider(provider);
-  const mod = PROVIDERS[provider];
+  const mod = providerModule(provider);
   if (!mod) {
     return openaiErrorResponse(400, `Unknown provider "${provider}" — or add it to the \`endpoints\` map in ${userConfigPath()}`, 'unknown_provider');
   }
@@ -1085,7 +1209,7 @@ Respond with:
     this.api_key = this._factoryApiKey;
     if (this.proxy && this.base_url == null) this.base_url = this.proxy;
     if (this.proxy) {
-      this.client = PROVIDERS['llama-server'];
+      this.client = PROVIDERS.generic;
       this.model = resolvedModel;
     } else {
       // Dynamic `endpoints` map first (config.yaml: provider_name → endpoint).
@@ -1093,7 +1217,7 @@ Respond with:
       // client; `<UPPER>_API_KEY` / `<UPPER>_CA_FILE` envs supply credentials.
       const ep = (await readUserEndpoints())[this.provider];
       if (ep) {
-        this.client = PROVIDERS.openai;
+        this.client = PROVIDERS.generic;
         if (this.base_url == null) {
           const url = typeof ep === 'string' ? ep : ep.url;
           this.base_url = _templateEndpoint(url, this.model);
@@ -1115,22 +1239,25 @@ Respond with:
             null;
           if (cf) this.ca_file = String(cf);
         }
+        // Config quirks win over a built-in set for the same provider id.
+        this.endpoint_quirks =
+          _quirksFromEntry(ep) ?? _builtinEndpoint(this.provider)?.quirks ?? null;
       } else {
-        this.client = PROVIDERS[this.provider];
+        this.client = providerModule(this.provider);
         if (!this.client) {
           throw new Error(
-            `Unknown AI provider: ${this.provider}. Known: ${Object.keys(PROVIDERS).join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}.`,
+            `Unknown AI provider: ${this.provider}. Known: ${knownProviderIds().join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}.`,
           );
         }
-        if (this.provider === 'llama-server') {
-          const local = _llamaServerEndpoint();
-          if (this.base_url == null) this.base_url = local.base_url;
-          if (this.api_key == null) this.api_key = local.api_key;
-        } else if (this.provider === 'openai') {
-          // Hosted OpenAI fallback when the map has no `openai` entry.
-          if (this.base_url == null) {
-            this.base_url = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
+        const builtin = _builtinEndpoint(this.provider);
+        if (builtin) {
+          if (this.base_url == null && builtin.base_url != null) {
+            this.base_url = builtin.base_url;
           }
+          if (this.api_key == null && builtin.api_key != null) {
+            this.api_key = builtin.api_key;
+          }
+          this.endpoint_quirks = builtin.quirks ?? null;
         }
       }
     }
@@ -1152,7 +1279,7 @@ Respond with:
             ? _normalizeGatewayProvider(wideModelSpec.slice(0, widx))
             : null;
         this._wideModel = wideProvider ? wideModelSpec.slice(widx + 1) : wideModelSpec;
-        this._wideClient = wideProvider ? PROVIDERS[wideProvider] : this.client;
+        this._wideClient = wideProvider ? providerModule(wideProvider) : this.client;
         if (this._wideClient && this._wideClient !== this.client) {
           await this._wideClient.init({
             base_url: this.base_url,
@@ -1170,8 +1297,144 @@ Respond with:
     await this._bindModel(spec);
   }
 
+  /**
+   * Bind the System One (decision) model named by `decision_model`.
+   *
+   * Kept entirely separate from the System Two binding above: an agent may
+   * hold both, and `switch()` must never fall back to the generative model.
+   */
+  async _bindDecisionModel(spec) {
+    const resolved = String(spec || '').trim();
+    const idx = resolved.indexOf(':');
+    if (idx <= 0 || idx >= resolved.length - 1) {
+      throw new Error(
+        `Invalid decision_model format: ${resolved}. Expected "provider:model" (e.g. systemone:default).`,
+      );
+    }
+    const provider = _normalizeGatewayProvider(resolved.slice(0, idx));
+    const model = resolved.slice(idx + 1);
+    const client = providerModule(provider);
+    if (!client) {
+      throw new Error(
+        `Unknown decision provider: ${provider}. Known: ${knownProviderIds().join(', ')} — or add it to the \`endpoints\` map in ${userConfigPath()}.`,
+      );
+    }
+    if (typeof client.decisions !== 'function') {
+      throw new Error(
+        `Provider ${provider} has no decision endpoint. decision_model needs an ` +
+          'OpenAI-compatible server that also serves POST /v1/systemone.',
+      );
+    }
+    const extra = _endpointExtra(provider, model);
+    this.decision_provider = provider;
+    this.decision_model = model;
+    this.decision_spec = `${provider}:${model}`;
+    this.decision_client = client;
+    this.decision_base_url = extra.base_url ?? null;
+    this.decision_api_key = extra.api_key ?? null;
+    this.decision_ca_file = extra.ca_file ?? null;
+    if (!this.decision_base_url) {
+      throw new Error(
+        `No endpoint for decision provider "${provider}" — add it to the \`endpoints\` map in ${userConfigPath()} ` +
+          '(e.g. `systemone: http://127.0.0.1:1237`) or set SYSTEMONE_URL.',
+      );
+    }
+  }
+
+  /** One decision request: every question at this state, answered together. */
+  async _decide({ state, questions, signal }) {
+    if (!this.decision_client) {
+      throw new Error(
+        'agent.switch() needs a decision model — pass decision_model to Agent.factory() ' +
+          '(e.g. decision_model: "systemone:default").',
+      );
+    }
+    return await withProviderRetry(
+      (attempt) => this.decision_client.decisions({
+        model: this.decision_model,
+        state,
+        questions,
+        signal: attempt?.signal ?? signal ?? undefined,
+        base_url: this.decision_base_url,
+        ...(this.decision_api_key != null ? { api_key: this.decision_api_key } : {}),
+        ...(this.decision_ca_file ? { ca_file: this.decision_ca_file } : {}),
+      }),
+      {
+        ...(this.timeout_ms != null ? { timeoutMs: this.timeout_ms } : {}),
+        ...(signal ? { signal } : {}),
+        ...(this.retry_attempts != null ? { attempts: this.retry_attempts } : {}),
+      },
+    );
+  }
+
+  /**
+   * Run a finite-choice decision loop over the System One model.
+   *
+   * See src/switch.mjs for the domain contract. Deliberately a sibling of
+   * run(): it does not touch the generative run loop, its output-tool nudge
+   * machinery, or max_turns.
+   *
+   *   const out = await agent.switch({ domain, input: { ticket } });
+   *   const same = await agent.switch({ domain, trace, replay: true }); // free
+   *   const more = await agent.switch({ domain, trace, fork: 3 });
+   *
+   * @returns {Promise<{state, answers, trace, steps, ended, usage}>}
+   */
+  async switch({
+    domain,
+    input,
+    state,
+    replay = null,
+    fork = null,
+    trace = null,
+    bool_threshold = 0.5,
+    signal = null,
+  } = {}) {
+    // A pure replay needs no endpoint at all, so don't demand one.
+    const needsModel = !replay || fork != null;
+    if (needsModel && !this.decision_client) {
+      throw new Error(
+        'agent.switch() needs a decision model — pass decision_model to Agent.factory() ' +
+          '(e.g. decision_model: "systemone:default").',
+      );
+    }
+
+    let replaySource = replay;
+    if (typeof replay === 'string' && !replay.includes('\n')) {
+      // A bare path, not JSONL content.
+      const { readFile } = await import('fs/promises');
+      replaySource = await readFile(replay, 'utf8');
+    }
+
+    const result = await runSwitch({
+      domain,
+      input,
+      state,
+      replay: replaySource,
+      fork,
+      describe: this.decision_spec ?? null,
+      bool_threshold,
+      signal: signal ?? undefined,
+      decide: needsModel
+        ? (args) => this._decide({ ...args, signal: signal ?? undefined })
+        : undefined,
+    });
+
+    if (trace) {
+      const { writeFile, mkdir } = await import('fs/promises');
+      const { dirname } = await import('path');
+      await mkdir(dirname(trace), { recursive: true });
+      await writeFile(trace, formatTrace(result.trace), 'utf8');
+    }
+    return result;
+  }
+
   static async factory({
     model,
+    // System One (decision) model, e.g. 'systemone:default'. Independent of
+    // `model`: one agent can hold a generative model and a decision model.
+    // Required by agent.switch(), unused by agent.run().
+    decision_model,
     system_prompt,
     // Optional Handlebars-like substitution against system_prompt (see
     // src/lib/mini-handlebars.mjs). Omitted → system_prompt used as-is.
@@ -1349,6 +1612,10 @@ Respond with:
       if (!inst.tool_choice) {
         inst.tool_choice = 'required';
       }
+    }
+
+    if (decision_model) {
+      await inst._bindDecisionModel(decision_model);
     }
 
     return inst;
@@ -1626,6 +1893,12 @@ Respond with:
       const req = { model: activeModel, messages };
       if (hasTools) req.tools = this._renderTools();
       if (this.tool_choice) req.tool_choice = this.tool_choice;
+      // Endpoint quirks (see _quirksFromEntry). Meta Muse, for one, rejects
+      // every tool_choice except "auto" and has no streaming path.
+      const quirks = this.endpoint_quirks;
+      if (quirks?.tool_choice !== undefined && (hasTools || req.tool_choice !== undefined)) {
+        req.tool_choice = quirks.tool_choice;
+      }
       if (this.reasoning_effort) req.reasoning_effort = this.reasoning_effort;
       // Provider long-context hint (number), not the message array
       if (this.context_window_size) {
@@ -1638,8 +1911,9 @@ Respond with:
       // Allow '' so llama-server does not inherit MYCLOUD_API_KEY.
       if (this.api_key != null) req.api_key = this.api_key;
       if (this.ca_file) req.ca_file = this.ca_file;
-      if (this.stream) req.stream = this.stream;
-      if (this.stream && this.on_delta) req.on_delta = this.on_delta;
+      const mayStream = quirks?.stream === false ? false : Boolean(this.stream);
+      if (mayStream) req.stream = this.stream;
+      if (mayStream && this.on_delta) req.on_delta = this.on_delta;
       // Client-side abort of the HTTP stream (Stop / new prompt interrupt)
       req.signal = runSignal;
 
@@ -1928,7 +2202,7 @@ Respond with:
     }
     const provider = resolved.slice(0, idx);
     const modelId = resolved.slice(idx + 1);
-    const client = PROVIDERS[provider];
+    const client = providerModule(provider);
     if (!client) throw new Error(`Unknown provider: ${provider}`);
     if (typeof client.embeddings !== 'function') {
       throw new Error(`Provider ${provider} does not support embeddings`);

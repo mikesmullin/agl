@@ -5,7 +5,13 @@ import { homedir } from 'os';
 import { join } from 'path';
 
 /**
- * openai — GENERIC OpenAI-compatible provider.
+ * generic — the OpenAI-compatible provider (formerly `openai`).
+ *
+ * This is AGL's ONE built-in HTTP client for any server that speaks the
+ * OpenAI chat-completions / embeddings API. The `openai` and `llama-server`
+ * provider ids are kept as deprecated aliases for it (see PROVIDER_ALIASES in
+ * agent.mjs); the xai, ollama, lm-studio and runpod providers were removed in
+ * favour of `endpoints` map entries that route here.
  *
  * Replaces the old `mycloud` provider (renamed; the `mycloud` name is now a
  * DYNAMIC provider resolved through the `endpoints` map in the user config).
@@ -186,7 +192,7 @@ async function _fetch({ method, uri, body, signal, base_url, api_key, ca_file })
     opts.body = JSON.stringify(body);
   }
 
-  debug('openai _request.', {
+  debug('generic _request.', {
     method,
     uri,
     base: resolvedBase,
@@ -211,13 +217,13 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
   if (response.ok) return response;
 
   const errorBody = await response.text();
-  debug('openai _request error.', {
+  debug('generic _request error.', {
     status: response.status,
     statusText: response.statusText,
     body: errorBody,
   });
-  console.error(`[openai] ${response.status} ${response.statusText}`);
-  if (errorBody) console.error(`[openai] response body: ${errorBody}`);
+  console.error(`[generic] ${response.status} ${response.statusText}`);
+  if (errorBody) console.error(`[generic] response body: ${errorBody}`);
   // Surface the server's own code/message in the Error text (not just status):
   // harnesses match on it (vision_disabled vs context_length_exceeded) and
   // the session log would otherwise swallow the only useful diagnostic.
@@ -232,7 +238,7 @@ async function _request({ method, uri, body, signal, base_url, api_key, ca_file 
   } catch {
     if (errorBody) detail = ` (${errorBody.slice(0, 200)})`;
   }
-  const err = new Error(`openai-compatible request error: ${response.status} ${response.statusText}${detail}`);
+  const err = new Error(`generic (openai-compatible) request error: ${response.status} ${response.statusText}${detail}`);
   err.status = response.status;
   err.body = errorBody;
   throw err;
@@ -488,4 +494,86 @@ export async function inference({
     }],
     usage,
   };
+}
+
+/**
+ * POST /v1/systemone — native typed-decision endpoint (TypeSafe-compatible).
+ *
+ * This is NOT chat completions. A decision model answers typed questions about
+ * a `state` in one forward pass per question, all questions in one request,
+ * and generates no tokens (`usage.output_tokens` is always 0). Servers that
+ * advertise `output_modalities: ["decisions"]` serve it; a chat-only model
+ * returns 501.
+ *
+ * @param {object}  o
+ * @param {unknown} o.state     string | object | array (non-strings are sent as JSON text)
+ * @param {object}  o.questions { id: { type: 'choice'|'score'|'noul', instructions, criteria } }
+ * @param {string[]} [o.files]  data: URLs (images/audio); alias `images`
+ * @returns {Promise<{ model: string, answers: object, usage: object }>}
+ */
+export async function decisions({
+  model,
+  state,
+  questions,
+  files,
+  signal,
+  base_url,
+  api_key,
+  ca_file,
+} = {}) {
+  if (!questions || typeof questions !== 'object' || Array.isArray(questions)) {
+    throw new Error('decisions: `questions` must be an object of question id → question');
+  }
+  // The server rejects an empty set with a 400; the caller is supposed to
+  // treat "no questions" as the end of a run, so fail loudly rather than
+  // spending a round trip to learn that.
+  if (Object.keys(questions).length === 0) {
+    const err = new Error('decisions: `questions` is empty — an empty question set ends a run, it is not a request');
+    err.code = 'EMPTY_QUESTIONS';
+    throw err;
+  }
+
+  const body = { state: state ?? null, questions };
+  if (model) body.model = model;
+  if (files?.length) body.files = files;
+
+  const response = await _fetch({
+    method: 'POST',
+    uri: '/v1/systemone',
+    body,
+    signal,
+    base_url,
+    api_key,
+    ca_file,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    let detail = '';
+    try {
+      const parsed = JSON.parse(errorBody);
+      const code = parsed?.error?.code ?? parsed?.code;
+      const message = parsed?.error?.message ?? parsed?.message;
+      if (code || message) detail = ` (${[code, message].filter(Boolean).join(': ')})`;
+    } catch {
+      if (errorBody) detail = ` (${errorBody.slice(0, 200)})`;
+    }
+    // 501 is the server's own "this is not a decision model" signal.
+    if (response.status === 501) {
+      const err = new Error(
+        `This endpoint is not a decision model (501 from /v1/systemone)${detail}. ` +
+          'Point `decision_model` at a server whose /v1/models reports ' +
+          'output_modalities: ["decisions"].',
+      );
+      err.code = 'NOT_A_DECISION_MODEL';
+      err.status = 501;
+      throw err;
+    }
+    const err = new Error(`/v1/systemone request error: ${response.status} ${response.statusText}${detail}`);
+    err.status = response.status;
+    err.body = errorBody;
+    throw err;
+  }
+
+  return await response.json();
 }

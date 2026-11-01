@@ -6,16 +6,12 @@
   "main": "src/agent.mjs",
   "exports": {
     ".": "./src/agent.mjs",
-    "./providers/xai": "./src/providers/xai.mjs",
+    "./providers/generic": "./src/providers/generic.mjs",
     "./providers/copilot": "./src/providers/copilot.mjs",
-    "./providers/runpod": "./src/providers/runpod.mjs",
-    "./providers/ollama": "./src/providers/ollama.mjs",
-    "./providers/lm-studio": "./src/providers/lm-studio.mjs",
-    "./providers/meta": "./src/providers/meta.mjs",
-    "./providers/muse": "./src/providers/meta.mjs",
-    "./providers/llama-server": "./src/providers/openai.mjs",
-    "./providers/openai": "./src/providers/openai.mjs",
-    "./providers/anthropic": "./src/providers/anthropic.mjs"
+    "./providers/meta": "./src/providers/generic.mjs",
+    "./providers/muse": "./src/providers/generic.mjs",
+    "./providers/llama-server": "./src/providers/generic.mjs",
+    "./providers/openai": "./src/providers/generic.mjs"
   },
   "scripts": {
     "test": "bun test"
@@ -32,8 +28,7 @@
     "llm",
     "tool-calling",
     "bun",
-    "xai",
-    "grok",
+    "openai-compatible",
     "copilot"
   ],
   "author": "Mike Smullin <mike@smullindesign.com>",
