@@ -1,11 +1,18 @@
 # agl-rs
 
 Rust port of [`agl-ai`](../agl) — a minimalist Pydantic-AI-style agent
-library. Lives on the `rust` orphan branch of the same repository; the
-JavaScript source it was ported from is kept under `js/` as the reference.
+library. Lives on the `rust` orphan branch of the same repository.
 
-See **[PORT_STATUS.md](PORT_STATUS.md)** for what is and is not ported, and
-for the measured Blaze compile-time comparison.
+The branch is an orphan, so the JavaScript it was ported from is not checked
+out beside it. Paths like `src/agent.mjs` in the `//!` headers refer to that
+JS tree, which is read from the JS branch without switching worktrees:
+
+```sh
+git show main:src/agent.mjs
+```
+
+`PORT_STATUS.md` has what is and is not ported, plus the measured Blaze
+compile-time comparison. It is kept as local notes and is not committed.
 
 ## Build
 

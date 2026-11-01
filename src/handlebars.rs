@@ -1,4 +1,4 @@
-//! mini-handlebars — port of `js/src/lib/mini-handlebars.mjs`.
+//! mini-handlebars — port of `src/lib/mini-handlebars.mjs`.
 //!
 //! Supported: `{{path}}`, `{{#if}}`/`{{#unless}}/{{#each}}/{{#with}}` with
 //! `{{else}}` and `{{else if}}`, `{{this}}`, `./`, `../`, `@index`/`@key`/

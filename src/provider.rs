@@ -1,6 +1,6 @@
 //! generic — the OpenAI-compatible provider.
 //!
-//! Port of `js/src/providers/generic.mjs`. One HTTP client for any server
+//! Port of `src/providers/generic.mjs`. One HTTP client for any server
 //! that speaks the OpenAI chat-completions / embeddings API, plus the native
 //! `POST /v1/systemone` decision endpoint.
 //!

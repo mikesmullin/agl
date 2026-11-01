@@ -1,4 +1,4 @@
-//! Config — port of `js/src/lib/config.mjs`.
+//! Config — port of `src/lib/config.mjs`.
 //!
 //! The YAML parser is deliberately the same narrow subset as the JS original:
 //! comments, nested maps, quoted/plain scalars, integers. That is everything
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(y.get("n").unwrap().as_i64(), Some(-5));
         // Quirk kept deliberately: the JS original unquotes BEFORE coercing,
         // so a quoted "true" still becomes a boolean. Verified against
-        // js/src/lib/config.mjs rather than assumed.
+        // src/lib/config.mjs rather than assumed.
         assert_eq!(y.get("q").unwrap().as_bool(), Some(true));
         assert_eq!(y.get("s").unwrap().as_str(), Some("hi there"));
     }

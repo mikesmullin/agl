@@ -1,6 +1,6 @@
 //! switch — a finite-choice decision loop over a System One model.
 //!
-//! Port of `js/src/switch.mjs`. The shape comes from osolmaz/switch:
+//! Port of `src/switch.mjs`. The shape comes from osolmaz/switch:
 //! your code offers a short list of typed questions, the model picks, your
 //! code transitions, and the run ends when there are no questions left.
 //!
