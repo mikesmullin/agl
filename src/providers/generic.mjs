@@ -79,11 +79,32 @@ async function tlsFetchOpts(caFile) {
   }
   // Reused llama-server certs often have the previous VM IP as SAN.
   // Trust the CA, but do not require the hostname/IP to match.
-  const tls = { ca, checkServerIdentity: skipHostname };
   let opts;
   if (typeof Bun !== 'undefined') {
-    opts = { tls };
+    // Bun's `fetch({ tls: { ca } })` does NOT add the CA to the system
+    // roots — it replaces the default root store with only the supplied CA,
+    // so a proxy-only CA (e.g. mycloud) breaks verification of any public
+    // endpoint (api.meta.ai → "unable to get local issuer certificate").
+    // Append it to NODE_EXTRA_CA_CERTS instead: Bun honors that variable at
+    // runtime and it layers on top of the default roots, so public endpoints
+    // keep verifying while the custom-CA path (SAN-skipping proxy) still works.
+    const existing = (process.env.NODE_EXTRA_CA_CERTS ?? '').trim();
+    const entries = existing ? [existing] : [];
+    try {
+      // NODE_EXTRA_CA_CERTS may be a file path (Node convention) or PEM text;
+      // normalize paths to contents so the trust store stays additive.
+      entries[0] = await readFile(existing, 'utf8');
+    } catch {
+      /* keep as raw text if it isn't a readable path */
+    }
+    entries.push(ca);
+    process.env.NODE_EXTRA_CA_CERTS = entries
+      .map((p) => String(p).trim())
+      .filter(Boolean)
+      .join('\n');
+    opts = { tls: { checkServerIdentity: skipHostname } };
   } else {
+    const tls = { ca, checkServerIdentity: skipHostname };
     try {
       const { Agent } = await import('undici');
       opts = { dispatcher: new Agent({ connect: tls }) };
