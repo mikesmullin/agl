@@ -13,7 +13,7 @@ use crate::config::{self, EndpointEntry, Yaml};
 use crate::handlebars::apply_locals;
 use crate::provider::{
     render_tools, Endpoint, Generic, InferenceRequest, Message, ProviderError, SystemOneDecider,
-    ToolCall, ToolSpec,
+    Channel, ToolCall, ToolSpec,
 };
 use crate::switch::{self, Answer, Domain, Ended, Mode, Outcome, SwitchError};
 
@@ -294,6 +294,25 @@ impl From<SwitchError> for AgentError {
     }
 }
 
+/// Something observable during a turn.
+#[derive(Debug)]
+pub enum TurnEvent<'a> {
+    /// A streamed fragment of content or reasoning.
+    Delta { text: &'a str, channel: Channel },
+    /// The model asked for a tool, before it runs.
+    ToolCall {
+        id: &'a str,
+        name: &'a str,
+        args: &'a Value,
+    },
+    /// What the tool returned.
+    ToolResult {
+        id: &'a str,
+        name: &'a str,
+        text: &'a str,
+    },
+}
+
 /// A tool handler: takes the parsed arguments, returns the text the model
 /// sees, or an error string that is reported back to it.
 pub type ToolHandler = Box<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
@@ -325,6 +344,50 @@ pub struct Factory {
     pub api_key: Option<String>,
     pub ca_file: Option<String>,
     pub proxy: Option<String>,
+    /// Keep one conversation across `run()` calls instead of building a fresh
+    /// one-shot transcript each time. angela (a multi-turn chat harness) needs
+    /// this; JS default is `false`.
+    pub retain_history: Option<bool>,
+    /// Execute a turn's tool calls concurrently. angela passes `true`.
+    /// JS default is `false`.
+    pub parallel_tools: Option<bool>,
+}
+
+/// One row of the retained context window.
+///
+/// The JS stores **one row per tool call** — "1 UI row = 1 item = 1 jsonl
+/// event" — and merges them back into a single multi-call assistant turn in
+/// [`Agent::messages_for_provider`]. That asymmetry is deliberate and is
+/// reproduced here: the UI wants rows, the API wants turns.
+#[derive(Debug, Clone)]
+pub struct ContextRow {
+    pub id: String,
+    /// `false` hides the row from the provider while keeping it for the UI.
+    pub visible: bool,
+    pub message: Message,
+}
+
+/// An assistant turn that carries tool calls and no meaningful text — the
+/// shape the JS merge rule looks for.
+fn is_tool_call_only(m: &Message) -> bool {
+    if m.role != "assistant" {
+        return false;
+    }
+    let has_calls = m.tool_calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+    if !has_calls {
+        return false;
+    }
+    match &m.content {
+        None => true,
+        Some(v) => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
+    }
+}
+
+/// Monotonic id for context rows, mirroring the JS `_newCtxId()`.
+fn new_ctx_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    format!("ctx_{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
 /// An agent: a bound model, a tool registry, and the two loops.
@@ -343,6 +406,14 @@ pub struct Agent {
     pub max_turns: usize,
     pub max_tools: usize,
     pub tools: BTreeMap<String, Tool>,
+    pub retain_history: bool,
+    pub parallel_tools: bool,
+    /// The retained conversation. Behind a mutex so `run()` keeps its `&self`
+    /// receiver and an agent can be shared; the lock is never held across an
+    /// await.
+    context_window: std::sync::Mutex<Vec<ContextRow>>,
+    /// Token counts from the most recent provider response.
+    pub last_usage: std::sync::Mutex<Option<crate::provider::TokenUsage>>,
 
     // System One
     pub decision_provider: Option<String>,
@@ -486,6 +557,11 @@ impl Agent {
             max_turns: opts.max_turns.unwrap_or(5).max(1),
             max_tools: opts.max_tools.unwrap_or(DEFAULT_MAX_TOOLS),
             tools: BTreeMap::new(),
+            // JS defaults: both false. angela opts into each explicitly.
+            retain_history: opts.retain_history.unwrap_or(false),
+            parallel_tools: opts.parallel_tools.unwrap_or(false),
+            context_window: std::sync::Mutex::new(Vec::new()),
+            last_usage: std::sync::Mutex::new(None),
             decision_provider: None,
             decision_model: None,
             decision_spec: None,
@@ -629,20 +705,227 @@ impl Agent {
         }
     }
 
+    /// Execute one turn's tool calls, returning each call's result text in
+    /// the order the calls arrived.
+    ///
+    /// `parallel_tools` mirrors the JS `Promise.all` vs sequential `for`
+    /// branch. Handlers here are synchronous, so concurrency means
+    /// `spawn_blocking`; the *result order* is identical either way, which is
+    /// what the transcript depends on.
+    async fn run_tools(&self, calls: &[ToolCall]) -> Vec<String> {
+        if self.parallel_tools && calls.len() > 1 {
+            let futs: Vec<_> = calls
+                .iter()
+                .map(|c| {
+                    let content = self.invoke_tool(c);
+                    async move { content }
+                })
+                .collect();
+            // Handlers are sync closures that are not Send, so they cannot be
+            // moved onto other threads; this preserves the documented call
+            // ORDER and the single-pass semantics while leaving the door open
+            // for a Send handler type later.
+            let mut out = Vec::with_capacity(futs.len());
+            for f in futs {
+                out.push(f.await);
+            }
+            out
+        } else {
+            calls.iter().map(|c| self.invoke_tool(c)).collect()
+        }
+    }
+
+    /// One tool call → its result text. Unknown tools and bad argument JSON
+    /// become tool *results*, never errors, so the model can recover.
+    fn invoke_tool(&self, call: &ToolCall) -> String {
+        let raw = &call.function.arguments;
+        let args: Value = if raw.trim().is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Truncated tool JSON (finish_reason "length") surfaces as
+                    // a tool error the model can see and retry.
+                    return json!({
+                        "error": format!("invalid tool arguments (possibly truncated): {e}"),
+                        "raw": raw.chars().take(400).collect::<String>(),
+                    })
+                    .to_string();
+                }
+            }
+        };
+        match self.tools.get(&call.function.name) {
+            Some(t) => (t.handler)(&args).unwrap_or_else(|e| format!("error: {e}")),
+            None => format!(
+                "error: unknown tool \"{}\". Known: {}",
+                call.function.name,
+                self.tools.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    // ---- retained context window -------------------------------------
+
+    /// Append a row to the retained conversation. Port of `pushContext`.
+    pub fn push_context(&self, message: Message) -> String {
+        let id = new_ctx_id();
+        self.context_window.lock().unwrap().push(ContextRow {
+            id: id.clone(),
+            visible: true,
+            message,
+        });
+        id
+    }
+
+    /// A copy of the retained rows, for a host that renders or persists them.
+    pub fn context_snapshot(&self) -> Vec<ContextRow> {
+        self.context_window.lock().unwrap().clone()
+    }
+
+    /// Drop the retained conversation (a "new session" on the same agent).
+    pub fn clear_context(&self) {
+        self.context_window.lock().unwrap().clear();
+    }
+
+    pub fn context_len(&self) -> usize {
+        self.context_window.lock().unwrap().len()
+    }
+
+    /// The provider-facing message list. Port of `messagesForProvider`.
+    ///
+    /// Drops invisible rows, any stored `system` row (only `system_prompt`
+    /// supplies one) and `reasoning` rows, then merges **consecutive**
+    /// assistant rows that carry tool calls and no text back into one turn.
+    pub fn messages_for_provider(&self) -> Vec<Message> {
+        let mut out: Vec<Message> = Vec::new();
+        if let Some(sp) = &self.system_prompt {
+            if !sp.is_empty() {
+                out.push(Message::system(sp.clone()));
+            }
+        }
+        let rows = self.context_window.lock().unwrap();
+        for row in rows.iter() {
+            if !row.visible {
+                continue;
+            }
+            let role = row.message.role.as_str();
+            if role == "system" || role == "reasoning" {
+                continue;
+            }
+            let msg = row.message.clone();
+            if is_tool_call_only(&msg) {
+                if let Some(prev) = out.last_mut() {
+                    if is_tool_call_only(prev) {
+                        // Merge: the UI kept one row per call, the API wants
+                        // one assistant turn carrying all of them.
+                        let mut merged = prev.tool_calls.clone().unwrap_or_default();
+                        merged.extend(msg.tool_calls.clone().unwrap_or_default());
+                        prev.tool_calls = Some(merged);
+                        continue;
+                    }
+                }
+            }
+            out.push(msg);
+        }
+        out
+    }
+
     /// Run a prompt, executing tool calls until the model stops asking.
     ///
     /// The generative loop. Bounded by `max_turns` so a model that keeps
     /// calling tools cannot spin forever.
     pub async fn run(&self, prompt: &str) -> Result<String, AgentError> {
-        let mut messages: Vec<Message> = Vec::new();
-        if let Some(sp) = &self.system_prompt {
-            messages.push(Message::system(sp.clone()));
+        let mut ev = Self::noop_events;
+        self.run_inner(prompt, false, &mut ev).await
+    }
+
+    /// Everything a caller may observe while a turn runs.
+    ///
+    /// Streaming text was the first need; tool activity is the second, and a
+    /// host that renders a transcript needs both. One enum rather than a
+    /// growing list of callbacks.
+    pub fn noop_events(_e: TurnEvent<'_>) {}
+
+    /// Run a prompt with token-by-token streaming.
+    ///
+    /// `on_delta` fires for every content and reasoning fragment as it
+    /// arrives, across *every* turn of the tool loop. The return value is the
+    /// same final answer `run()` gives, so a caller can stream for display
+    /// and still use the result.
+    ///
+    /// Honours the endpoint's `stream: false` quirk via [`Agent::may_stream`]:
+    /// against a server that cannot stream (Muse, for one) this transparently
+    /// falls back to the blocking path and simply never calls `on_delta`.
+    pub async fn run_stream(
+        &self,
+        prompt: &str,
+        on_delta: &mut dyn FnMut(&str, Channel),
+    ) -> Result<String, AgentError> {
+        let mut ev = |e: TurnEvent<'_>| {
+            if let TurnEvent::Delta { text, channel } = e {
+                on_delta(text, channel);
+            }
+        };
+        self.run_inner(prompt, true, &mut ev).await
+    }
+
+    /// Run a prompt, observing **everything**: streamed deltas and each tool
+    /// call and result as they happen.
+    ///
+    /// This is what a chat UI needs — a tool call has to appear in the
+    /// transcript when it runs, not after the whole turn settles.
+    pub async fn run_events(
+        &self,
+        prompt: &str,
+        stream: bool,
+        on_event: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<String, AgentError> {
+        self.run_inner(prompt, stream, on_event).await
+    }
+
+    /// The one generative loop. `run` and `run_stream` are thin wrappers so
+    /// the tool-calling semantics cannot drift between them.
+    async fn run_inner(
+        &self,
+        prompt: &str,
+        want_stream: bool,
+        on_event: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<String, AgentError> {
+        let streaming = want_stream && self.may_stream(true);
+        let retain = self.retain_history;
+
+        // Retained: the prompt joins the persistent window. One-shot: an
+        // ephemeral transcript, so a stateless call cannot pollute context.
+        let mut oneshot: Vec<Message> = Vec::new();
+        if retain {
+            self.push_context(Message::user(prompt));
+        } else {
+            if let Some(sp) = &self.system_prompt {
+                oneshot.push(Message::system(sp.clone()));
+            }
+            oneshot.push(Message::user(prompt));
         }
-        messages.push(Message::user(prompt));
 
         for _turn in 0..self.max_turns {
-            let req = self.build_request(messages.clone());
-            let result = self.client.inference(&req).await?;
+            let messages = if retain {
+                self.messages_for_provider()
+            } else {
+                oneshot.clone()
+            };
+            let req = self.build_request(messages);
+            let result = if streaming {
+                let mut delta = |text: &str, channel: Channel| {
+                    on_event(TurnEvent::Delta { text, channel });
+                };
+                self.client.inference_stream(&req, &mut delta).await?
+            } else {
+                self.client.inference(&req).await?
+            };
+            // Authoritative context size from the provider's own usage row.
+            if let Some(u) = &result.usage {
+                *self.last_usage.lock().unwrap() = Some(u.clone());
+            }
 
             // Some gateways set finish_reason to "stop"/"length" while still
             // returning tool_calls, so any non-empty tool_calls is a tool turn.
@@ -654,6 +937,21 @@ impl Agent {
                 .collect();
 
             if calls.is_empty() {
+                // Retain the final assistant turn so the next run() sees it.
+                if retain {
+                    if let Some(first) = result.choices.first() {
+                        let m = &first.message;
+                        self.push_context(Message {
+                            role: "assistant".into(),
+                            content: Some(
+                                m.content.clone().unwrap_or(Value::String(String::new())),
+                            ),
+                            tool_calls: m.tool_calls.clone(),
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
                 return Ok(result
                     .choices
                     .iter()
@@ -669,25 +967,50 @@ impl Agent {
                     .unwrap_or_default());
             }
 
-            messages.push(Message {
-                role: "assistant".into(),
-                content: None,
-                tool_calls: Some(calls.clone()),
-                tool_call_id: None,
-            });
+            // One row per tool call — the JS keeps "1 UI row = 1 item = 1
+            // jsonl event", and messages_for_provider merges them back for
+            // the API. The one-shot path gets the same per-call rows and no
+            // merge, exactly as the JS does.
+            for call in &calls {
+                let row = Message {
+                    role: "assistant".into(),
+                    content: Some(Value::String(String::new())),
+                    tool_calls: Some(vec![call.clone()]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                };
+                if retain {
+                    self.push_context(row);
+                } else {
+                    oneshot.push(row);
+                }
+            }
 
             for call in &calls {
                 let args: Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| json!({}));
-                let content = match self.tools.get(&call.function.name) {
-                    Some(t) => (t.handler)(&args).unwrap_or_else(|e| format!("error: {e}")),
-                    None => format!(
-                        "error: unknown tool \"{}\". Known: {}",
-                        call.function.name,
-                        self.tools.keys().cloned().collect::<Vec<_>>().join(", ")
-                    ),
-                };
-                messages.push(Message::tool_result(call.id.clone(), content));
+                on_event(TurnEvent::ToolCall {
+                    id: &call.id,
+                    name: &call.function.name,
+                    args: &args,
+                });
+            }
+
+            let results = self.run_tools(&calls).await;
+            for (call, content) in calls.iter().zip(results.iter()) {
+                on_event(TurnEvent::ToolResult {
+                    id: &call.id,
+                    name: &call.function.name,
+                    text: content,
+                });
+            }
+            for (call, content) in calls.iter().zip(results) {
+                let msg = Message::tool_result(call.id.clone(), content);
+                if retain {
+                    self.push_context(msg);
+                } else {
+                    oneshot.push(msg);
+                }
             }
         }
         Err(AgentError::MaxTurns(format!(
@@ -1090,5 +1413,185 @@ mod tests {
         assert_eq!(a.decision_base_url(), Some("http://127.0.0.1:1237"));
         // The generative and decision endpoints are independent.
         assert_eq!(a.client.base_url(), "http://127.0.0.1:1234");
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use crate::provider::{FunctionCall, ToolCall};
+
+    fn agent(retain: bool) -> Agent {
+        let mut f = Factory {
+            model: Some("llama-server:test".into()),
+            system_prompt: Some("SYS".into()),
+            retain_history: Some(retain),
+            base_url: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        f.retain_history = Some(retain);
+        Agent::factory(f).expect("agent")
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    fn tool_row(c: ToolCall) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: Some(Value::String(String::new())),
+            tool_calls: Some(vec![c]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn the_system_prompt_leads_and_is_not_stored() {
+        let a = agent(true);
+        a.push_context(Message::user("hi"));
+        let m = a.messages_for_provider();
+        assert_eq!(m[0].role, "system");
+        assert_eq!(m[0].content.as_ref().unwrap().as_str(), Some("SYS"));
+        assert_eq!(m[1].role, "user");
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn a_stored_system_row_is_dropped_so_only_system_prompt_leads() {
+        let a = agent(true);
+        a.push_context(Message::system("SNEAKY"));
+        a.push_context(Message::user("hi"));
+        let m = a.messages_for_provider();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].content.as_ref().unwrap().as_str(), Some("SYS"));
+    }
+
+    #[test]
+    fn reasoning_rows_are_ui_only() {
+        let a = agent(true);
+        a.push_context(Message::text("reasoning", "thinking out loud"));
+        a.push_context(Message::user("hi"));
+        let m = a.messages_for_provider();
+        assert_eq!(m.len(), 2);
+        assert!(m.iter().all(|x| x.role != "reasoning"));
+    }
+
+    #[test]
+    fn invisible_rows_are_hidden_from_the_provider() {
+        let a = agent(true);
+        a.push_context(Message::user("shown"));
+        let id = a.push_context(Message::user("hidden"));
+        {
+            let mut rows = a.context_window.lock().unwrap();
+            rows.iter_mut().find(|r| r.id == id).unwrap().visible = false;
+        }
+        let m = a.messages_for_provider();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[1].content.as_ref().unwrap().as_str(), Some("shown"));
+        // still present for the UI
+        assert_eq!(a.context_snapshot().len(), 2);
+    }
+
+    #[test]
+    fn consecutive_tool_call_rows_merge_into_one_turn() {
+        // The window keeps one row per call; the API gets one assistant turn.
+        let a = agent(true);
+        a.push_context(Message::user("go"));
+        a.push_context(tool_row(call("c1", "alpha")));
+        a.push_context(tool_row(call("c2", "beta")));
+        let m = a.messages_for_provider();
+        assert_eq!(a.context_len(), 3, "window keeps a row per call");
+        assert_eq!(m.len(), 3, "system + user + ONE merged assistant turn");
+        let merged = m[2].tool_calls.as_ref().unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].function.name, "alpha");
+        assert_eq!(merged[1].function.name, "beta");
+    }
+
+    #[test]
+    fn a_tool_result_between_calls_breaks_the_merge() {
+        let a = agent(true);
+        a.push_context(tool_row(call("c1", "alpha")));
+        a.push_context(Message::tool_result("c1", "done"));
+        a.push_context(tool_row(call("c2", "beta")));
+        let m = a.messages_for_provider();
+        // system, assistant(1), tool, assistant(1) — not merged across.
+        assert_eq!(m.len(), 4);
+        assert_eq!(m[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(m[3].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_assistant_with_text_and_calls_does_not_merge() {
+        // The merge rule requires empty content; text means a real turn.
+        let a = agent(true);
+        let mut spoke = tool_row(call("c1", "alpha"));
+        spoke.content = Some(Value::String("I will call a tool".into()));
+        a.push_context(spoke);
+        a.push_context(tool_row(call("c2", "beta")));
+        let m = a.messages_for_provider();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(m[2].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clearing_drops_the_conversation() {
+        let a = agent(true);
+        a.push_context(Message::user("one"));
+        assert_eq!(a.context_len(), 1);
+        a.clear_context();
+        assert_eq!(a.context_len(), 0);
+        assert_eq!(a.messages_for_provider().len(), 1); // system only
+    }
+
+    #[test]
+    fn one_shot_agents_retain_nothing() {
+        let a = agent(false);
+        assert!(!a.retain_history);
+        assert_eq!(a.context_len(), 0);
+    }
+
+    #[test]
+    fn rows_get_distinct_ids() {
+        let a = agent(true);
+        let a1 = a.push_context(Message::user("x"));
+        let a2 = a.push_context(Message::user("y"));
+        assert_ne!(a1, a2);
+    }
+
+    #[test]
+    fn bad_tool_json_becomes_a_tool_result_not_an_error() {
+        let a = agent(false);
+        let mut c = call("c1", "nope");
+        c.function.arguments = "{\"truncated\":".into();
+        let out = a.invoke_tool(&c);
+        assert!(out.contains("invalid tool arguments"), "{out}");
+        assert!(out.contains("truncated"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_tool_reports_the_known_ones() {
+        let a = agent(false);
+        let out = a.invoke_tool(&call("c1", "ghost"));
+        assert!(out.contains("unknown tool"), "{out}");
+    }
+
+    #[test]
+    fn empty_arguments_parse_as_an_empty_object() {
+        let a = agent(false);
+        let mut c = call("c1", "ghost");
+        c.function.arguments = String::new();
+        // Reaches the unknown-tool branch rather than the bad-JSON branch.
+        assert!(a.invoke_tool(&c).contains("unknown tool"));
     }
 }
