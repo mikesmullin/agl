@@ -106,6 +106,10 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Assembled reasoning text. The JS sets `message.reasoning_content` only
+    /// when the stream carried any, so this stays `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -124,6 +128,7 @@ impl Message {
             content: Some(Value::String(text.into())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -132,6 +137,7 @@ impl Message {
             content: Some(Value::String(content.into())),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
         }
     }
 }
@@ -305,12 +311,13 @@ impl Generic {
         }
     }
 
-    /// `POST /v1/chat/completions`.
-    pub async fn inference(&self, req: &InferenceRequest) -> Result<Completion, ProviderError> {
+    /// The request body both `inference` and `inference_stream` send. One
+    /// builder so the two paths cannot drift in what they ask the model for.
+    fn build_body(&self, req: &InferenceRequest, stream: bool) -> Value {
         let mut body = Map::new();
         body.insert("model".into(), json!(req.model));
         body.insert("messages".into(), json!(req.messages));
-        body.insert("stream".into(), json!(false));
+        body.insert("stream".into(), json!(stream));
         if let Some(t) = &req.tools {
             if t.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
                 body.insert("tools".into(), t.clone());
@@ -333,9 +340,23 @@ impl Generic {
                 body.insert("reasoning_effort".into(), json!(e));
             }
         }
+        if stream {
+            // Ask for the trailing usage row; without this most servers omit
+            // usage entirely on a streamed response.
+            body.insert(
+                "stream_options".into(),
+                json!({ "include_usage": true }),
+            );
+        }
+        Value::Object(body)
+    }
+
+    /// `POST /v1/chat/completions`.
+    pub async fn inference(&self, req: &InferenceRequest) -> Result<Completion, ProviderError> {
+        let body = self.build_body(req, false);
 
         let resp = self
-            .post("/v1/chat/completions", &Value::Object(body))
+            .post("/v1/chat/completions", &body)
             .send()
             .await
             .map_err(|e| {
@@ -351,6 +372,55 @@ impl Generic {
         resp.json::<Completion>()
             .await
             .map_err(|e| ProviderError::Decode(format!("decoding chat completion: {e}")))
+    }
+
+    /// `POST /v1/chat/completions` with `stream: true`.
+    ///
+    /// Returns the same [`Completion`] the non-streaming path returns, after
+    /// invoking `on_delta` for every content and reasoning fragment as it
+    /// arrives. Port of the JS `inference({stream:true})` branch.
+    pub async fn inference_stream(
+        &self,
+        req: &InferenceRequest,
+        on_delta: &mut dyn FnMut(&str, Channel),
+    ) -> Result<Completion, ProviderError> {
+        use futures_util::StreamExt;
+
+        let body = self.build_body(req, true);
+        let resp = self
+            .post("/v1/chat/completions", &body)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::Transport(format!(
+                    "Unable to connect to the openai-compatible endpoint at {}/v1/chat/completions: {e}. \
+                     Check the `endpoints` map in ~/.config/agl/config.yaml.",
+                    self.endpoint.base_url
+                ))
+            })?;
+        if !resp.status().is_success() {
+            return Err(Self::error_for(resp).await);
+        }
+
+        let mut asm = StreamAssembler::new();
+        let mut buf = String::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(part) = stream.next().await {
+            let bytes = part.map_err(|e| {
+                ProviderError::Transport(format!("reading the response stream: {e}"))
+            })?;
+            // from_utf8_lossy on a chunk boundary could split a multi-byte
+            // char; buffer as bytes would be stricter, but the JS uses a
+            // streaming TextDecoder which behaves this way too for valid UTF-8.
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            asm.feed(&mut buf, on_delta);
+        }
+        // The JS flushes a trailing partial line after the reader ends.
+        let tail = buf.trim().to_string();
+        if !tail.is_empty() {
+            asm.handle_line(&tail, on_delta);
+        }
+        Ok(asm.finish())
     }
 
     /// `GET /v1/models`.
@@ -626,5 +696,427 @@ mod tests {
         assert_eq!(v[0]["function"]["name"], "spin");
         assert_eq!(v[0]["function"]["parameters"]["type"], "object");
         assert_eq!(v[0]["function"]["parameters"]["required"][0], "n");
+    }
+}
+
+// ===========================================================================
+// Streaming — port of the SSE path in `agl/src/providers/generic.mjs`
+// (`inference({stream:true})`, lines ~387-517).
+// ===========================================================================
+
+/// Which channel a streamed delta belongs to.
+///
+/// The JS passes `{ channel: 'content' | 'reasoning' }` as the second argument
+/// to `on_delta`; this is that, as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Content,
+    Reasoning,
+}
+
+impl Channel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Content => "content",
+            Channel::Reasoning => "reasoning",
+        }
+    }
+}
+
+/// Assembles one streamed completion from `data:` lines.
+///
+/// Split out from the transport so the wire format can be tested against
+/// recorded chunks with no network — which is the only way to check parity
+/// with the JS line-handler cheaply.
+///
+/// Faithful to the JS in several places where it is easy to "improve" it by
+/// accident; each is marked below.
+#[derive(Debug, Default)]
+pub struct StreamAssembler {
+    content: String,
+    reasoning: String,
+    /// Keyed by the chunk's `index`, so holes are dropped on collection the
+    /// way JS's `toolCalls.filter(Boolean)` drops sparse-array holes.
+    tool_calls: std::collections::BTreeMap<u64, ToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<TokenUsage>,
+    /// `true` once a `data: [DONE]` has been seen. Informational: the JS
+    /// simply returns from the handler, it does not stop reading.
+    pub saw_done: bool,
+}
+
+impl StreamAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Handle one line of the stream. Anything that is not a `data:` line is
+    /// ignored, as are blank payloads, `[DONE]`, and unparseable JSON — the
+    /// JS `return`s on each of those rather than erroring, and a strict parser
+    /// here would turn a tolerated server quirk into a failed turn.
+    pub fn handle_line(&mut self, line: &str, on_delta: &mut dyn FnMut(&str, Channel)) {
+        let Some(rest) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = rest.trim();
+        if data.is_empty() {
+            return;
+        }
+        if data == "[DONE]" {
+            self.saw_done = true;
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+
+        // Usage rides its own trailing chunk; last one wins, as in JS.
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                if let Ok(parsed) = serde_json::from_value::<TokenUsage>(u.clone()) {
+                    self.usage = Some(parsed);
+                }
+            }
+        }
+
+        let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+            return;
+        };
+        if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            // JS tests truthiness, so "" never overwrites a real reason.
+            if !fr.is_empty() {
+                self.finish_reason = Some(fr.to_string());
+            }
+        }
+        let empty = json!({});
+        let delta = choice.get("delta").unwrap_or(&empty);
+
+        // Reasoning aliases, in the JS order, joined by `??` — nullish, NOT
+        // falsy. An alias present but empty therefore *masks* the later ones
+        // instead of falling through to them. Reproduced deliberately.
+        let rdelta = ["reasoning_content", "reasoning", "reasoning_text", "thinking"]
+            .iter()
+            .find_map(|k| match delta.get(*k) {
+                Some(v) if !v.is_null() => Some(v),
+                _ => None,
+            });
+        if let Some(r) = rdelta.and_then(|v| v.as_str()) {
+            if !r.is_empty() {
+                self.reasoning.push_str(r);
+                on_delta(r, Channel::Reasoning);
+            }
+        }
+
+        // `if (delta.content)` — truthy, so an empty string emits nothing.
+        if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+            if !c.is_empty() {
+                self.content.push_str(c);
+                on_delta(c, Channel::Content);
+            }
+        }
+
+        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                let i = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let slot = self.tool_calls.entry(i).or_insert_with(|| ToolCall {
+                    id: format!("call_{i}"),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: String::new(),
+                    },
+                });
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        slot.id = id.to_string();
+                    }
+                }
+                if let Some(f) = tc.get("function") {
+                    // Both name and arguments ACCUMULATE across chunks.
+                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                        if !n.is_empty() {
+                            slot.function.name.push_str(n);
+                        }
+                    }
+                    if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                        if !a.is_empty() {
+                            slot.function.arguments.push_str(a);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Feed a raw byte chunk, dispatching every complete line. Returns the
+    /// leftover partial line, which the caller prepends to the next chunk.
+    pub fn feed(&mut self, buf: &mut String, on_delta: &mut dyn FnMut(&str, Channel)) {
+        while let Some(idx) = buf.find('\n') {
+            let line: String = buf[..idx].trim().to_string();
+            buf.drain(..=idx);
+            self.handle_line(&line, on_delta);
+        }
+    }
+
+    /// The assembled completion, in the exact shape the non-streaming path
+    /// returns, so callers cannot tell which path produced it.
+    pub fn finish(self) -> Completion {
+        let assembled: Vec<ToolCall> = self.tool_calls.into_values().collect();
+        let finish_reason = self.finish_reason.unwrap_or_else(|| {
+            if assembled.is_empty() {
+                "stop".to_string()
+            } else {
+                "tool_calls".to_string()
+            }
+        });
+        let message = Message {
+            role: "assistant".to_string(),
+            // The JS seeds `content: ''` and always returns it, even when the
+            // turn was pure tool calls — so this is Some("") not None.
+            content: Some(Value::String(self.content)),
+            tool_calls: if assembled.is_empty() {
+                None
+            } else {
+                Some(assembled)
+            },
+            tool_call_id: None,
+            reasoning_content: if self.reasoning.is_empty() {
+                None
+            } else {
+                Some(self.reasoning)
+            },
+        };
+        Completion {
+            choices: vec![Choice {
+                message,
+                finish_reason: Some(finish_reason),
+            }],
+            usage: self.usage,
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// Run lines through the assembler, returning (deltas, completion).
+    fn run(lines: &[&str]) -> (Vec<(String, Channel)>, Completion) {
+        let mut asm = StreamAssembler::new();
+        let mut seen: Vec<(String, Channel)> = Vec::new();
+        {
+            let mut cb = |t: &str, c: Channel| seen.push((t.to_string(), c));
+            for l in lines {
+                asm.handle_line(l, &mut cb);
+            }
+        }
+        (seen, asm.finish())
+    }
+
+    fn content_of(c: &Completion) -> String {
+        c.choices[0]
+            .message
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn content_deltas_accumulate_and_stream() {
+        let (seen, c) = run(&[
+            r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ]);
+        assert_eq!(content_of(&c), "Hello");
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            seen,
+            vec![
+                ("Hel".to_string(), Channel::Content),
+                ("lo".to_string(), Channel::Content)
+            ]
+        );
+    }
+
+    #[test]
+    fn non_data_lines_blank_payloads_and_bad_json_are_ignored() {
+        let (seen, c) = run(&[
+            ": a comment",
+            "event: ping",
+            "data:",
+            "data: {not json",
+            r#"data: {"choices":[{"delta":{"content":"ok"}}]}"#,
+        ]);
+        assert_eq!(content_of(&c), "ok");
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn data_without_a_space_is_still_a_data_line() {
+        // JS slices 5 chars then trims, so `data:{...}` parses.
+        let (_, c) = run(&[r#"data:{"choices":[{"delta":{"content":"x"}}]}"#]);
+        assert_eq!(content_of(&c), "x");
+    }
+
+    #[test]
+    fn reasoning_rides_its_own_channel_and_lands_on_the_message() {
+        let (seen, c) = run(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"think"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"ans"}}]}"#,
+        ]);
+        assert_eq!(seen[0], ("think".to_string(), Channel::Reasoning));
+        assert_eq!(seen[1], ("ans".to_string(), Channel::Content));
+        assert_eq!(
+            c.choices[0].message.reasoning_content.as_deref(),
+            Some("think")
+        );
+        assert_eq!(content_of(&c), "ans");
+    }
+
+    #[test]
+    fn every_reasoning_alias_is_accepted() {
+        for key in ["reasoning_content", "reasoning", "reasoning_text", "thinking"] {
+            let line = format!(r#"data: {{"choices":[{{"delta":{{"{key}":"r"}}}}]}}"#);
+            let (seen, _) = run(&[&line]);
+            assert_eq!(seen, vec![("r".to_string(), Channel::Reasoning)], "{key}");
+        }
+    }
+
+    #[test]
+    fn an_empty_earlier_alias_masks_a_later_one() {
+        // `??` is nullish, not falsy: "" short-circuits the chain, and the
+        // `&& rdelta` guard then drops it. Parity with the JS, quirk included.
+        let (seen, c) = run(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"","reasoning":"masked"}}]}"#,
+        ]);
+        assert!(seen.is_empty());
+        assert_eq!(c.choices[0].message.reasoning_content, None);
+    }
+
+    #[test]
+    fn a_null_alias_falls_through_to_the_next() {
+        let (seen, _) = run(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":null,"reasoning":"used"}}]}"#,
+        ]);
+        assert_eq!(seen, vec![("used".to_string(), Channel::Reasoning)]);
+    }
+
+    #[test]
+    fn tool_calls_assemble_by_index_across_chunks() {
+        let (_, c) = run(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"get_","arguments":"{\"a\""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":":1}"}}]}}]}"#,
+        ]);
+        let calls = c.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+        // No explicit finish_reason + tool calls present => "tool_calls".
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn a_tool_call_without_an_id_gets_the_indexed_fallback() {
+        let (_, c) = run(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"f"}}]}}]}"#,
+        ]);
+        let calls = c.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].id, "call_2");
+    }
+
+    #[test]
+    fn sparse_tool_call_indices_collapse_in_order() {
+        // JS builds a sparse array then `.filter(Boolean)`; holes vanish and
+        // the survivors keep index order.
+        let (_, c) = run(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":5,"function":{"name":"late"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"early"}}]}}]}"#,
+        ]);
+        let calls = c.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "early");
+        assert_eq!(calls[1].function.name, "late");
+    }
+
+    #[test]
+    fn missing_index_defaults_to_zero() {
+        let (_, c) = run(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"a"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"b"}}]}}]}"#,
+        ]);
+        let calls = c.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ab");
+    }
+
+    #[test]
+    fn usage_comes_from_the_trailing_chunk_and_last_one_wins() {
+        let (_, c) = run(&[
+            r#"data: {"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        ]);
+        let u = c.usage.unwrap();
+        assert_eq!(u.prompt_tokens, Some(10));
+        assert_eq!(u.total_tokens, Some(15));
+    }
+
+    #[test]
+    fn an_empty_content_delta_emits_nothing() {
+        let (seen, c) = run(&[r#"data: {"choices":[{"delta":{"content":""}}]}"#]);
+        assert!(seen.is_empty());
+        assert_eq!(content_of(&c), "");
+    }
+
+    #[test]
+    fn a_pure_tool_turn_still_carries_an_empty_string_content() {
+        // JS seeds `content: ''`, so downstream `.content` is never undefined.
+        let (_, c) = run(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f"}}]}}]}"#,
+        ]);
+        assert_eq!(content_of(&c), "");
+        assert!(c.choices[0].message.content.is_some());
+    }
+
+    #[test]
+    fn no_finish_reason_and_no_tools_defaults_to_stop() {
+        let (_, c) = run(&[r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#]);
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn feed_splits_on_newlines_and_keeps_the_partial_tail() {
+        let mut asm = StreamAssembler::new();
+        let mut buf = String::new();
+        let mut seen: Vec<String> = Vec::new();
+        // A chunk boundary falls mid-line, as it does on the wire.
+        buf.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\ndata: {\"choi");
+        {
+            let mut cb = |t: &str, _c: Channel| seen.push(t.to_string());
+            asm.feed(&mut buf, &mut cb);
+        }
+        assert_eq!(seen, vec!["a".to_string()]);
+        buf.push_str("ces\":[{\"delta\":{\"content\":\"b\"}}]}\n");
+        {
+            let mut cb = |t: &str, _c: Channel| seen.push(t.to_string());
+            asm.feed(&mut buf, &mut cb);
+        }
+        assert_eq!(seen, vec!["a".to_string(), "b".to_string()]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn done_is_recorded_but_does_not_stop_assembly() {
+        // JS `return`s from the handler on [DONE]; it keeps reading the body.
+        let (seen, c) = run(&[
+            "data: [DONE]",
+            r#"data: {"choices":[{"delta":{"content":"after"}}]}"#,
+        ]);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(content_of(&c), "after");
     }
 }
