@@ -705,34 +705,17 @@ impl Agent {
         }
     }
 
-    /// Execute one turn's tool calls, returning each call's result text in
-    /// the order the calls arrived.
-    ///
-    /// `parallel_tools` mirrors the JS `Promise.all` vs sequential `for`
-    /// branch. Handlers here are synchronous, so concurrency means
-    /// `spawn_blocking`; the *result order* is identical either way, which is
-    /// what the transcript depends on.
+    /// Execute synchronous tool handlers in order, yielding between calls so
+    /// a surrounding cancellation race can stop before the next one starts.
     async fn run_tools(&self, calls: &[ToolCall]) -> Vec<String> {
-        if self.parallel_tools && calls.len() > 1 {
-            let futs: Vec<_> = calls
-                .iter()
-                .map(|c| {
-                    let content = self.invoke_tool(c);
-                    async move { content }
-                })
-                .collect();
-            // Handlers are sync closures that are not Send, so they cannot be
-            // moved onto other threads; this preserves the documented call
-            // ORDER and the single-pass semantics while leaving the door open
-            // for a Send handler type later.
-            let mut out = Vec::with_capacity(futs.len());
-            for f in futs {
-                out.push(f.await);
-            }
-            out
-        } else {
-            calls.iter().map(|c| self.invoke_tool(c)).collect()
+        let mut out = Vec::with_capacity(calls.len());
+        for call in calls {
+            // Handlers are synchronous. Yield after each one so the outer
+            // cancellation race can observe a stop before another call starts.
+            out.push(self.invoke_tool(call));
+            tokio::task::yield_now().await;
         }
+        out
     }
 
     /// One tool call → its result text. Unknown tools and bad argument JSON
@@ -1567,6 +1550,24 @@ mod context_tests {
         let a1 = a.push_context(Message::user("x"));
         let a2 = a.push_context(Message::user("y"));
         assert_ne!(a1, a2);
+    }
+
+    #[test]
+    fn cancellation_wins_before_the_next_tool_starts() {
+        let mut a = agent(false);
+        let signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let trigger = signal.clone();
+        a.tool("first", "", json!({}), vec![], move |_| { trigger.notify_one(); Ok("done".into()) }).unwrap();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        a.tool("second", "", json!({}), vec![], move |_| { flag.store(true, std::sync::atomic::Ordering::SeqCst); Ok("done".into()) }).unwrap();
+        let calls = vec![call("1", "first"), call("2", "second")];
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let stopped = rt.block_on(async {
+            tokio::select! { biased; _ = signal.notified() => true, _ = a.run_tools(&calls) => false }
+        });
+        assert!(stopped);
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
