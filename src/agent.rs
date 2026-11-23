@@ -255,6 +255,75 @@ pub fn resolve_context_window(spec: &str) -> u64 {
     FALLBACK_CONTEXT_WINDOW
 }
 
+/// Turn concurrency for a `provider:model` spec, from the `concurrency`
+/// config group (same shape as `context_windows`). Default is 1 — serial —
+/// because the expensive mistake is over-parallelising a local model.
+///
+/// Lookup mirrors [`resolve_context_window`]: provider group (plus its
+/// meta/muse alias) → exact model id → case-insensitive id → group
+/// `default` → 1. Re-read from disk on every call, so editing the config
+/// changes the limit without a restart (turns already holding a slot keep
+/// it; the next acquisition sees the new limit).
+pub fn resolve_concurrency(spec: &str) -> usize {
+    let (provider, model) = split_provider_model(spec);
+    let cfg = config::read_user_config();
+    let Some(group) = cfg.get("concurrency").and_then(|w| w.as_map()) else {
+        return 1;
+    };
+    let pick = |g: &BTreeMap<String, Yaml>, key: &str| -> Option<usize> {
+        let n = g.get(key)?.as_i64()?;
+        if n > 0 {
+            Some(n as usize)
+        } else {
+            None
+        }
+    };
+    let mut groups: Vec<&BTreeMap<String, Yaml>> = Vec::new();
+    if let Some(g) = group.get(&provider).and_then(|g| g.as_map()) {
+        groups.push(g);
+    }
+    let alias = match provider.as_str() {
+        "meta" => Some("muse"),
+        "muse" => Some("meta"),
+        _ => None,
+    };
+    if let Some(a) = alias {
+        if let Some(g) = group.get(a).and_then(|g| g.as_map()) {
+            if !groups.iter().any(|existing| std::ptr::eq(*existing, g)) {
+                groups.push(g);
+            }
+        }
+    }
+    if groups.is_empty() {
+        return 1;
+    }
+    for g in &groups {
+        if let Some(n) = pick(g, &model) {
+            return n;
+        }
+    }
+    if !model.is_empty() {
+        let lower = model.to_lowercase();
+        for g in &groups {
+            for (k, v) in g.iter() {
+                if k.to_lowercase() == lower {
+                    if let Some(n) = v.as_i64() {
+                        if n > 0 {
+                            return n as usize;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for g in &groups {
+        if let Some(n) = pick(g, "default") {
+            return n;
+        }
+    }
+    1
+}
+
 #[derive(Debug)]
 pub enum AgentError {
     UnknownProvider(String),
@@ -297,6 +366,10 @@ impl From<SwitchError> for AgentError {
 /// Something observable during a turn.
 #[derive(Debug)]
 pub enum TurnEvent<'a> {
+    /// The turn had to wait for a free slot of its `provider:model` before
+    /// inference could start (the turn queue — see [`crate::queue`]).
+    /// `position` is its place in line when the wait began (1 = next).
+    Queued { spec: &'a str, position: usize },
     /// A streamed fragment of content or reasoning.
     Delta { text: &'a str, channel: Channel },
     /// The model asked for a tool, before it runs.
@@ -878,6 +951,20 @@ impl Agent {
         let streaming = want_stream && self.may_stream(true);
         let retain = self.retain_history;
 
+        // The turn queue: one slot per `provider:model` (c=N from the user
+        // config), held until the turn ends. When the slot is not free the
+        // wait is announced first, so the transcript shows why nothing is
+        // streaming yet. The permit releases on every exit path — answer,
+        // error, or cancellation — because it is dropped, not returned.
+        let st = crate::queue::stats(&self.bound_spec);
+        if st.held >= st.limit || st.waiting > 0 {
+            on_event(TurnEvent::Queued {
+                spec: &self.bound_spec,
+                position: st.waiting + 1,
+            });
+        }
+        let _permit = crate::queue::acquire(&self.bound_spec).await;
+
         // Retained: the prompt joins the persistent window. One-shot: an
         // ephemeral transcript, so a stateless call cannot pollute context.
         let mut oneshot: Vec<Message> = Vec::new();
@@ -1195,6 +1282,35 @@ mod tests {
         assert_eq!(resolve_context_window("xai:grok-4.6"), 500_000);
         // Unknown provider entirely -> the global fallback.
         assert_eq!(resolve_context_window("acme:thing"), FALLBACK_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn concurrency_resolves_like_context_windows_and_defaults_to_one() {
+        let _g = ENV.lock().unwrap();
+        // No config at all -> 1 (serial).
+        {
+            let _cfg = with_config("default_model: llama-server:default\n");
+            assert_eq!(resolve_concurrency("llama-server:default"), 1);
+        }
+        let _cfg = with_config(
+            "concurrency:\n\
+            \x20 llama-server:\n\
+            \x20   default: 1\n\
+            \x20   big: 2\n\
+            \x20 openai:\n\
+            \x20   default: 4\n",
+        );
+        // Exact model id wins over the group default.
+        assert_eq!(resolve_concurrency("llama-server:big"), 2);
+        // Unknown id under a known provider -> the group's default.
+        assert_eq!(resolve_concurrency("llama-server:small"), 1);
+        // Group default is enough for a whole hosted provider.
+        assert_eq!(resolve_concurrency("openai:gpt-5"), 4);
+        // Unknown provider entirely -> 1.
+        assert_eq!(resolve_concurrency("acme:thing"), 1);
+        // Zero / negative in the config never disables the queue.
+        let _cfg = with_config("concurrency:\n  llama-server:\n    default: 0\n");
+        assert_eq!(resolve_concurrency("llama-server:default"), 1);
     }
 
     #[test]
