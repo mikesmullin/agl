@@ -893,7 +893,7 @@ impl Agent {
     /// calling tools cannot spin forever.
     pub async fn run(&self, prompt: &str) -> Result<String, AgentError> {
         let mut ev = Self::noop_events;
-        self.run_inner(prompt, false, &mut ev).await
+        self.run_inner(Message::user(prompt), false, &mut ev).await
     }
 
     /// Everything a caller may observe while a turn runs.
@@ -923,7 +923,7 @@ impl Agent {
                 on_delta(text, channel);
             }
         };
-        self.run_inner(prompt, true, &mut ev).await
+        self.run_inner(Message::user(prompt), true, &mut ev).await
     }
 
     /// Run a prompt, observing **everything**: streamed deltas and each tool
@@ -937,14 +937,27 @@ impl Agent {
         stream: bool,
         on_event: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<String, AgentError> {
-        self.run_inner(prompt, stream, on_event).await
+        self.run_inner(Message::user(prompt), stream, on_event).await
+    }
+
+    /// The generative loop with a **prebuilt user message** — the shape a
+    /// caller needs when the prompt is more than text. An attached image
+    /// rides as OpenAI content parts (`image_url` data URLs), not as words;
+    /// `content` is a `Value` precisely so one message can be either.
+    pub async fn run_message(
+        &self,
+        user: Message,
+        stream: bool,
+        on_event: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<String, AgentError> {
+        self.run_inner(user, stream, on_event).await
     }
 
     /// The one generative loop. `run` and `run_stream` are thin wrappers so
     /// the tool-calling semantics cannot drift between them.
     async fn run_inner(
         &self,
-        prompt: &str,
+        user: Message,
         want_stream: bool,
         on_event: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<String, AgentError> {
@@ -969,12 +982,12 @@ impl Agent {
         // ephemeral transcript, so a stateless call cannot pollute context.
         let mut oneshot: Vec<Message> = Vec::new();
         if retain {
-            self.push_context(Message::user(prompt));
+            self.push_context(user);
         } else {
             if let Some(sp) = &self.system_prompt {
                 oneshot.push(Message::system(sp.clone()));
             }
-            oneshot.push(Message::user(prompt));
+            oneshot.push(user);
         }
 
         for _turn in 0..self.max_turns {
