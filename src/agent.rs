@@ -64,6 +64,12 @@ pub struct Quirks {
     pub stream: Option<bool>,
     /// This endpoint serves the native `/v1/systemone` decision API.
     pub decisions: Option<bool>,
+    /// `Some(false)` → tool messages may not carry image parts (Meta Muse
+    /// answers 400 `did not match any supported type` for them, while user
+    /// content takes images fine — verified against the live endpoint).
+    /// Tool-result images are then ferried into a synthetic user message
+    /// behind their tool message, so the model still sees the pixels.
+    pub tool_images: Option<bool>,
 }
 
 impl Quirks {
@@ -72,6 +78,7 @@ impl Quirks {
             tool_choice: e.tool_choice.clone(),
             stream: e.stream,
             decisions: e.decisions,
+            tool_images: e.tool_images,
         };
         if q == Quirks::default() {
             None
@@ -87,6 +94,53 @@ pub struct Builtin {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub quirks: Option<Quirks>,
+}
+
+/// Endpoints that take images in user content but not in tool content get
+/// the pixels through the other door: the tool message keeps its text and
+/// the image parts ride a synthetic user message right behind it — the
+/// model still sees the picture, and the wire shape stays legal. No-op for
+/// messages without image parts.
+fn ferry_tool_images(messages: Vec<Message>) -> Vec<Message> {
+    let mut out = Vec::with_capacity(messages.len() + 2);
+    for m in messages {
+        let is_tool = m.role == "tool";
+        let Some(Value::Array(parts)) = m.content.as_ref() else {
+            out.push(m);
+            continue;
+        };
+        let has_images = parts
+            .iter()
+            .any(|p| p.get("type").and_then(Value::as_str) == Some("image_url"));
+        if !is_tool || !has_images {
+            out.push(m);
+            continue;
+        }
+        let mut text_parts: Vec<Value> = Vec::new();
+        let mut images: Vec<Value> = Vec::new();
+        for p in parts {
+            if p.get("type").and_then(Value::as_str) == Some("image_url") {
+                images.push(p.clone());
+            } else {
+                text_parts.push(p.clone());
+            }
+        }
+        let mut tool_msg = m;
+        tool_msg.content = Some(Value::Array(text_parts));
+        out.push(tool_msg);
+        let mut user_parts = vec![serde_json::json!(
+            {"type": "text", "text": "The tool result above carries this image — look at it directly:"}
+        )];
+        user_parts.extend(images);
+        out.push(Message {
+            role: "user".into(),
+            content: Some(Value::Array(user_parts)),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    out
 }
 
 /// Built-in endpoint bindings. These are what let `meta:` keep working with
@@ -137,6 +191,7 @@ pub fn builtin_endpoint(provider: &str) -> Option<Builtin> {
                 tool_choice: Some("auto".into()),
                 stream: Some(false),
                 decisions: None,
+                tool_images: Some(false),
             }),
         }),
         _ => None,
@@ -397,7 +452,7 @@ pub struct Tool {
 }
 
 /// Options for building an `Agent`, the counterpart of `Agent.factory({...})`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Factory {
     pub model: Option<String>,
     /// System One (decision) model, e.g. `systemone:default`. Independent of
@@ -424,6 +479,40 @@ pub struct Factory {
     /// Execute a turn's tool calls concurrently. angela passes `true`.
     /// JS default is `false`.
     pub parallel_tools: Option<bool>,
+    /// Reshape every message before the inference request is built — the
+    /// provider boundary. A host uses it to bring refs like `/media/…` into
+    /// the wire shape the endpoint accepts (image parts, say); the message
+    /// is otherwise untouched. `None` leaves the messages exactly as the
+    /// window assembled them.
+    pub message_filter: Option<std::sync::Arc<dyn Fn(Message) -> Message + Send + Sync>>,
+}
+
+// Hand-written because the filter is a boxed closure, which cannot derive Debug.
+impl std::fmt::Debug for Factory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Factory")
+            .field("model", &self.model)
+            .field("decision_model", &self.decision_model)
+            .field("system_prompt", &self.system_prompt)
+            .field("locals", &self.locals)
+            .field("tool_choice", &self.tool_choice)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("max_turns", &self.max_turns)
+            .field("max_tools", &self.max_tools)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key)
+            .field("ca_file", &self.ca_file)
+            .field("proxy", &self.proxy)
+            .field("retain_history", &self.retain_history)
+            .field("parallel_tools", &self.parallel_tools)
+            .field(
+                "message_filter",
+                &self.message_filter.as_ref().map(|_| "<message_filter>"),
+            )
+            .finish()
+    }
 }
 
 /// One row of the retained context window.
@@ -481,6 +570,10 @@ pub struct Agent {
     pub tools: BTreeMap<String, Tool>,
     pub retain_history: bool,
     pub parallel_tools: bool,
+    /// Provider-boundary reshaping of every message, applied exactly once per
+    /// request (see [`Agent::filtered_messages`]). `None` is the JS default:
+    /// the window's messages go out unchanged.
+    pub message_filter: Option<std::sync::Arc<dyn Fn(Message) -> Message + Send + Sync>>,
     /// The retained conversation. Behind a mutex so `run()` keeps its `&self`
     /// receiver and an agent can be shared; the lock is never held across an
     /// await.
@@ -627,12 +720,18 @@ impl Agent {
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,
             reasoning_effort: opts.reasoning_effort,
-            max_turns: opts.max_turns.unwrap_or(5).max(1),
+            // 0 = no limit (the loop runs until the model stops asking for
+            // tools); unset = the 5-turn default.
+            max_turns: match opts.max_turns.unwrap_or(5) {
+                0 => usize::MAX,
+                n => n.max(1),
+            },
             max_tools: opts.max_tools.unwrap_or(DEFAULT_MAX_TOOLS),
             tools: BTreeMap::new(),
             // JS defaults: both false. angela opts into each explicitly.
             retain_history: opts.retain_history.unwrap_or(false),
             parallel_tools: opts.parallel_tools.unwrap_or(false),
+            message_filter: opts.message_filter,
             context_window: std::sync::Mutex::new(Vec::new()),
             last_usage: std::sync::Mutex::new(None),
             decision_provider: None,
@@ -887,6 +986,25 @@ impl Agent {
         out
     }
 
+    /// The one place a request's messages are finalized: the window (or the
+    /// one-shot transcript) exactly as the loop assembled it, then the
+    /// host's filter applied — every message exactly once, retained tool
+    /// messages included. `None` is a no-op, so `default = zero behavior change`.
+    fn filtered_messages(&self, messages: Vec<Message>) -> Vec<Message> {
+        let filtered = match &self.message_filter {
+            Some(filter) => messages.into_iter().map(|m| filter(m)).collect(),
+            None => messages,
+        };
+        // The filter may have turned tool results into image-carrying
+        // arrays; endpoints that cannot carry those get the pixels through
+        // a user message instead (see `ferry_tool_images`).
+        if self.endpoint_quirks.as_ref().and_then(|q| q.tool_images) == Some(false) {
+            ferry_tool_images(filtered)
+        } else {
+            filtered
+        }
+    }
+
     /// Run a prompt, executing tool calls until the model stops asking.
     ///
     /// The generative loop. Bounded by `max_turns` so a model that keeps
@@ -996,6 +1114,7 @@ impl Agent {
             } else {
                 oneshot.clone()
             };
+            let messages = self.filtered_messages(messages);
             let req = self.build_request(messages);
             let result = if streaming {
                 let mut delta = |text: &str, channel: Channel| {
@@ -1667,10 +1786,91 @@ mod context_tests {
     }
 
     #[test]
+    fn retained_tool_messages_pass_through_the_filter_once_each() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let mut f = Factory {
+            model: Some("llama-server:test".into()),
+            system_prompt: Some("SYS".into()),
+            retain_history: Some(true),
+            base_url: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        f.message_filter = Some(std::sync::Arc::new(move |m| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if m.role == "tool" {
+                let mut m = m;
+                let text = m.content.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+                m.content = Some(Value::String(format!("FILTERED: {text}")));
+                m
+            } else {
+                m
+            }
+        }));
+        let a = Agent::factory(f).expect("agent");
+        a.push_context(Message::user("go"));
+        a.push_context(tool_row(call("c1", "alpha")));
+        a.push_context(Message::tool_result("c1", "done"));
+
+        let msgs = a.messages_for_provider();
+        let out = a.filtered_messages(msgs.clone());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            msgs.len(),
+            "every message passes through exactly once"
+        );
+        let tool = out.iter().find(|m| m.role == "tool").expect("tool message");
+        assert_eq!(
+            tool.content.as_ref().and_then(|v| v.as_str()),
+            Some("FILTERED: done"),
+            "the retained tool message reached the filter"
+        );
+        assert_eq!(out.len(), msgs.len());
+    }
+
+    #[test]
+    fn without_a_filter_the_messages_pass_through_unchanged() {
+        let a = agent(true);
+        a.push_context(Message::user("go"));
+        a.push_context(tool_row(call("c1", "alpha")));
+        a.push_context(Message::tool_result("c1", "done"));
+        let msgs = a.messages_for_provider();
+        let out = a.filtered_messages(msgs.clone());
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            serde_json::to_value(&msgs).unwrap(),
+            "a default agent sends exactly what the window assembled"
+        );
+    }
+
+    #[test]
     fn one_shot_agents_retain_nothing() {
         let a = agent(false);
         assert!(!a.retain_history);
         assert_eq!(a.context_len(), 0);
+    }
+
+    #[test]
+    fn tool_images_ferry_into_a_user_message() {
+        let img = serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}});
+        let mut tool = Message::tool_result("c1", "see ![image](/media/x.png)");
+        tool.content = Some(serde_json::json!([
+            {"type": "text", "text": "see ![image](/media/x.png)"},
+            img
+        ]));
+        let plain = Message::tool_result("c2", "plain");
+        let out = ferry_tool_images(vec![tool, plain]);
+        assert_eq!(out.len(), 3, "tool-with-image splits, plain tool rides on");
+        // The tool message keeps only its text; the image rides the user
+        // message right behind it.
+        let first = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(first["role"], "tool");
+        assert!(first["content"].is_array());
+        assert_eq!(first["content"].as_array().unwrap().len(), 1);
+        assert_eq!(out[1].role, "user");
+        let second = serde_json::to_value(&out[1]).unwrap();
+        assert_eq!(second["content"].as_array().unwrap()[1]["type"], "image_url");
+        assert_eq!(out[2].role, "tool");
     }
 
     #[test]

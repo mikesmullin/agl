@@ -224,6 +224,7 @@ pub struct EndpointEntry {
     pub tool_choice: Option<String>,
     pub stream: Option<bool>,
     pub decisions: Option<bool>,
+    pub tool_images: Option<bool>,
 }
 
 /// The `endpoints` map: provider name → endpoint. Any key here is a dynamic
@@ -259,6 +260,7 @@ pub fn read_user_endpoints() -> BTreeMap<String, EndpointEntry> {
                         tool_choice: m.get("tool_choice").and_then(|v| v.to_scalar_string()),
                         stream: m.get("stream").and_then(|v| v.as_bool()),
                         decisions: m.get("decisions").and_then(|v| v.as_bool()),
+                        tool_images: m.get("tool_images").and_then(|v| v.as_bool()),
                     },
                 );
             }
