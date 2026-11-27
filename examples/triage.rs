@@ -1,11 +1,3 @@
-//! Live end-to-end check of the Rust port against the System One slot.
-//!
-//!   cargo run --example triage
-//!
-//! Mirrors the JS example in the README: read logs one at a time, stop when
-//! there is enough evidence, assign a team, score urgency. Then replay the
-//! trace with no model calls and show that drift is caught.
-
 use std::collections::BTreeMap;
 
 use agl::agent::{Agent, Factory};
@@ -21,7 +13,6 @@ const LOGS: [(&str, &str); 3] = [
 ];
 
 struct Triage {
-    /// Changed in the drift demo to simulate an edited domain.
     instructions: String,
 }
 
@@ -56,7 +47,7 @@ impl Domain for Triage {
     fn questions(&self, state: &Value) -> Result<BTreeMap<String, Question>, SwitchError> {
         let mut q = BTreeMap::new();
         if !state["team"].is_null() {
-            return Ok(q); // no questions ends the run
+            return Ok(q);
         }
         q.insert(
             "enough".to_string(),
@@ -148,7 +139,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let handle = tokio::runtime::Handle::current();
     let t0 = std::time::Instant::now();
-    // The loop is synchronous; the decider bridges to the async client.
     let out = tokio::task::spawn_blocking({
         let h = handle.clone();
         move || {
@@ -206,7 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --- replay: deterministic, zero model calls ---------------------------
     let jsonl = format_trace(&out.trace);
     let replayed = agent.replay(&domain, &jsonl)?;
     println!(
@@ -220,7 +209,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replayed.state == out.state
     );
 
-    // --- drift: the same trace against a changed domain -------------------
     let changed = Triage {
         instructions: "Pick a different log, reworded.".into(),
     };

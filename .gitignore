@@ -1,6 +1,5 @@
 target/
 
-# Local notes and tooling — kept on disk, out of the branch.
 /PLAN.md
 /PORT_STATUS.md
 /bench/

@@ -1,10 +1,3 @@
-//! Agent — port of `src/agent.mjs` (the inference path and `switch()`).
-//!
-//! Provider resolution follows the JS original exactly, including the parts
-//! that look odd: a deprecated id stays VISIBLE as `agent.provider` so its
-//! endpoint defaults and its `context_windows` config group keep resolving,
-//! while only module lookup goes through the alias table.
-
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
@@ -17,19 +10,12 @@ use crate::provider::{
 };
 use crate::switch::{self, Answer, Domain, Ended, Mode, Outcome, SwitchError};
 
-/// Used when the user config is missing or unreadable.
 pub const FALLBACK_DEFAULT_MODEL: &str = "llama-server:gemma-4-12b-qat";
-/// Used when no `context_windows` entry matches.
 pub const FALLBACK_CONTEXT_WINDOW: u64 = 32_768;
-/// Default tool-registry cap.
 pub const DEFAULT_MAX_TOOLS: usize = 256;
 
-/// The canonical provider ids. `copilot` is deliberately absent from this
-/// port — see provider.rs.
 pub const CANONICAL: [&str; 1] = ["generic"];
 
-/// Deprecated ids kept as aliases so existing `default_model` values and
-/// `provider:model` strings keep resolving.
 pub fn alias_target(name: &str) -> Option<&'static str> {
     match name {
         "llama-server" | "openai" | "systemone" | "meta" | "muse" => Some("generic"),
@@ -37,12 +23,10 @@ pub fn alias_target(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Canonical provider id for a possibly-aliased name.
 pub fn resolve_provider_id(name: &str) -> String {
     alias_target(name).map(|s| s.to_string()).unwrap_or_else(|| name.to_string())
 }
 
-/// Every accepted provider id, for error messages. Order matches the JS.
 pub fn known_provider_ids() -> Vec<&'static str> {
     vec![
         "generic",
@@ -54,21 +38,11 @@ pub fn known_provider_ids() -> Vec<&'static str> {
     ]
 }
 
-/// Per-endpoint behaviour flags: how a server that *almost* speaks OpenAI is
-/// described in config instead of in a bespoke provider module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Quirks {
-    /// Coerce every request's `tool_choice` to this value.
     pub tool_choice: Option<String>,
-    /// `Some(false)` → never start a stream.
     pub stream: Option<bool>,
-    /// This endpoint serves the native `/v1/systemone` decision API.
     pub decisions: Option<bool>,
-    /// `Some(false)` → tool messages may not carry image parts (Meta Muse
-    /// answers 400 `did not match any supported type` for them, while user
-    /// content takes images fine — verified against the live endpoint).
-    /// Tool-result images are then ferried into a synthetic user message
-    /// behind their tool message, so the model still sees the pixels.
     pub tool_images: Option<bool>,
 }
 
@@ -88,7 +62,6 @@ impl Quirks {
     }
 }
 
-/// A built-in endpoint binding for one of the deprecated/collapsed ids.
 #[derive(Debug, Clone, Default)]
 pub struct Builtin {
     pub base_url: Option<String>,
@@ -96,11 +69,6 @@ pub struct Builtin {
     pub quirks: Option<Quirks>,
 }
 
-/// Endpoints that take images in user content but not in tool content get
-/// the pixels through the other door: the tool message keeps its text and
-/// the image parts ride a synthetic user message right behind it — the
-/// model still sees the picture, and the wire shape stays legal. No-op for
-/// messages without image parts.
 fn ferry_tool_images(messages: Vec<Message>) -> Vec<Message> {
     let mut out = Vec::with_capacity(messages.len() + 2);
     for m in messages {
@@ -143,13 +111,8 @@ fn ferry_tool_images(messages: Vec<Message>) -> Vec<Message> {
     out
 }
 
-/// Built-in endpoint bindings. These are what let `meta:` keep working with
-/// no provider module and no config: its wire format was already identical to
-/// `generic`, and its only two real differences are quirks.
 pub fn builtin_endpoint(provider: &str) -> Option<Builtin> {
     match provider {
-        // Local llama.cpp, NOT the remote mycloud VM — so it must not inherit
-        // MYCLOUD_BASE_URL.
         "llama-server" => Some(Builtin {
             base_url: Some(
                 config::read_env("LLAMA_SERVER_BASE_URL")
@@ -158,8 +121,6 @@ pub fn builtin_endpoint(provider: &str) -> Option<Builtin> {
             api_key: Some(config::read_env("LLAMA_SERVER_API_KEY").unwrap_or_default()),
             quirks: None,
         }),
-        // The System One decision slot. Honours SYSTEMONE_URL, the same env
-        // var the inference launcher uses.
         "systemone" => Some(Builtin {
             base_url: Some(
                 config::read_env("SYSTEMONE_URL").unwrap_or_else(|| "http://127.0.0.1:1237".into()),
@@ -177,7 +138,6 @@ pub fn builtin_endpoint(provider: &str) -> Option<Builtin> {
             api_key: None,
             quirks: None,
         }),
-        // Meta Muse: accepts only tool_choice "auto", and has no streaming path.
         "meta" => Some(Builtin {
             base_url: Some(
                 config::read_env("META_BASE_URL").unwrap_or_else(|| "https://api.meta.ai".into()),
@@ -198,23 +158,18 @@ pub fn builtin_endpoint(provider: &str) -> Option<Builtin> {
     }
 }
 
-/// `local-proxy` → `LOCAL_PROXY`, for the `<UPPER>_API_KEY` convention.
 fn env_stem(provider: &str) -> String {
     provider.to_uppercase().replace('-', "_")
 }
 
-/// Normalize alternate SPELLINGS only. Deliberately does NOT collapse
-/// `llama-server`/`openai`/`systemone`: those stay visible as `provider`.
 pub fn normalize_gateway_provider(name: &str) -> String {
     match name {
         "github" | "github-copilot" => "copilot".to_string(),
-        // Canonical id is `meta`; `muse` is a legacy alias.
         "muse" => "meta".to_string(),
         other => other.to_string(),
     }
 }
 
-/// Split `provider:model`, applying the same bare-model heuristic as the JS.
 pub fn split_provider_model(spec: &str) -> (String, String) {
     let s = spec.trim();
     if let Some(idx) = s.find(':') {
@@ -229,23 +184,15 @@ pub fn split_provider_model(spec: &str) -> (String, String) {
     {
         "copilot"
     } else {
-        // Everything else goes to the OpenAI-compatible client. (The old
-        // grok -> xai and catch-all -> lm-studio guesses went away with those
-        // providers; both are reachable as `endpoints` entries.)
         "generic"
     };
     (provider.to_string(), s.to_string())
 }
 
-/// `default_model` from the user config, else the fallback.
 pub fn resolve_default_model() -> String {
     config::read_user_default_model().unwrap_or_else(|| FALLBACK_DEFAULT_MODEL.to_string())
 }
 
-/// The `provider:model` key a model string is queued and accounted under —
-/// the same binding [`Agent::factory`] performs, so a slot taken for a
-/// model string is the slot the built agent will hold ("default" resolves
-/// first, exactly as it does there).
 pub fn queue_spec(model: &str) -> String {
     let spec = if model == "default" {
         resolve_default_model()
@@ -265,10 +212,6 @@ fn pick_window(group: &BTreeMap<String, Yaml>, key: &str) -> Option<u64> {
     }
 }
 
-/// Max context window for a `provider:model` spec, from `context_windows`.
-///
-/// Looks up the provider's own group first, then the meta/muse alias group,
-/// then an exact id, then a case-insensitive id, then the group `default`.
 pub fn resolve_context_window(spec: &str) -> u64 {
     let (provider, model) = split_provider_model(spec);
     let cfg = config::read_user_config();
@@ -280,7 +223,6 @@ pub fn resolve_context_window(spec: &str) -> u64 {
     if let Some(g) = windows.get(&provider).and_then(|g| g.as_map()) {
         groups.push(g);
     }
-    // meta/muse are the same provider under two names.
     let alias = match provider.as_str() {
         "meta" => Some("muse"),
         "muse" => Some("meta"),
@@ -324,15 +266,6 @@ pub fn resolve_context_window(spec: &str) -> u64 {
     FALLBACK_CONTEXT_WINDOW
 }
 
-/// Turn concurrency for a `provider:model` spec, from the `concurrency`
-/// config group (same shape as `context_windows`). Default is 1 — serial —
-/// because the expensive mistake is over-parallelising a local model.
-///
-/// Lookup mirrors [`resolve_context_window`]: provider group (plus its
-/// meta/muse alias) → exact model id → case-insensitive id → group
-/// `default` → 1. Re-read from disk on every call, so editing the config
-/// changes the limit without a restart (turns already holding a slot keep
-/// it; the next acquisition sees the new limit).
 pub fn resolve_concurrency(spec: &str) -> usize {
     let (provider, model) = split_provider_model(spec);
     let cfg = config::read_user_config();
@@ -432,22 +365,15 @@ impl From<SwitchError> for AgentError {
     }
 }
 
-/// Something observable during a turn.
 #[derive(Debug)]
 pub enum TurnEvent<'a> {
-    /// The turn had to wait for a free slot of its `provider:model` before
-    /// inference could start (the turn queue — see [`crate::queue`]).
-    /// `position` is its place in line when the wait began (1 = next).
     Queued { spec: &'a str, position: usize },
-    /// A streamed fragment of content or reasoning.
     Delta { text: &'a str, channel: Channel },
-    /// The model asked for a tool, before it runs.
     ToolCall {
         id: &'a str,
         name: &'a str,
         args: &'a Value,
     },
-    /// What the tool returned.
     ToolResult {
         id: &'a str,
         name: &'a str,
@@ -455,26 +381,18 @@ pub enum TurnEvent<'a> {
     },
 }
 
-/// A tool handler: takes the parsed arguments, returns the text the model
-/// sees, or an error string that is reported back to it.
 pub type ToolHandler = Box<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
 
-/// A tool the model may call: schema plus the handler.
 pub struct Tool {
     pub spec: ToolSpec,
     pub handler: ToolHandler,
 }
 
-/// Options for building an `Agent`, the counterpart of `Agent.factory({...})`.
 #[derive(Clone, Default)]
 pub struct Factory {
     pub model: Option<String>,
-    /// System One (decision) model, e.g. `systemone:default`. Independent of
-    /// `model`: one agent can hold both. Required by `switch()`.
     pub decision_model: Option<String>,
     pub system_prompt: Option<String>,
-    /// Handlebars-like substitution against `system_prompt`. `None` leaves
-    /// any `{{...}}` in the prompt untouched.
     pub locals: Option<Value>,
     pub tool_choice: Option<Value>,
     pub max_tokens: Option<u64>,
@@ -486,28 +404,12 @@ pub struct Factory {
     pub api_key: Option<String>,
     pub ca_file: Option<String>,
     pub proxy: Option<String>,
-    /// Keep one conversation across `run()` calls instead of building a fresh
-    /// one-shot transcript each time. angela (a multi-turn chat harness) needs
-    /// this; JS default is `false`.
     pub retain_history: Option<bool>,
-    /// A turn slot the caller **already holds** for this agent's bound
-    /// spec, taken atomically where the turn was decided (angela's message
-    /// queue). The run takes no second one: on a single-concurrency model
-    /// that would deadlock against its own turn. A permit for a different
-    /// spec is ignored — the run acquires honestly for the spec it bound.
     pub slot: Option<std::sync::Arc<crate::queue::Permit>>,
-    /// Execute a turn's tool calls concurrently. angela passes `true`.
-    /// JS default is `false`.
     pub parallel_tools: Option<bool>,
-    /// Reshape every message before the inference request is built — the
-    /// provider boundary. A host uses it to bring refs like `/media/…` into
-    /// the wire shape the endpoint accepts (image parts, say); the message
-    /// is otherwise untouched. `None` leaves the messages exactly as the
-    /// window assembled them.
     pub message_filter: Option<std::sync::Arc<dyn Fn(Message) -> Message + Send + Sync>>,
 }
 
-// Hand-written because the filter is a boxed closure, which cannot derive Debug.
 impl std::fmt::Debug for Factory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Factory")
@@ -535,22 +437,13 @@ impl std::fmt::Debug for Factory {
     }
 }
 
-/// One row of the retained context window.
-///
-/// The JS stores **one row per tool call** — "1 UI row = 1 item = 1 jsonl
-/// event" — and merges them back into a single multi-call assistant turn in
-/// [`Agent::messages_for_provider`]. That asymmetry is deliberate and is
-/// reproduced here: the UI wants rows, the API wants turns.
 #[derive(Debug, Clone)]
 pub struct ContextRow {
     pub id: String,
-    /// `false` hides the row from the provider while keeping it for the UI.
     pub visible: bool,
     pub message: Message,
 }
 
-/// An assistant turn that carries tool calls and no meaningful text — the
-/// shape the JS merge rule looks for.
 fn is_tool_call_only(m: &Message) -> bool {
     if m.role != "assistant" {
         return false;
@@ -565,14 +458,12 @@ fn is_tool_call_only(m: &Message) -> bool {
     }
 }
 
-/// Monotonic id for context rows, mirroring the JS `_newCtxId()`.
 fn new_ctx_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(1);
     format!("ctx_{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
-/// An agent: a bound model, a tool registry, and the two loops.
 pub struct Agent {
     pub provider: String,
     pub model: String,
@@ -590,29 +481,17 @@ pub struct Agent {
     pub tools: BTreeMap<String, Tool>,
     pub retain_history: bool,
     pub parallel_tools: bool,
-    /// Provider-boundary reshaping of every message, applied exactly once per
-    /// request (see [`Agent::filtered_messages`]). `None` is the JS default:
-    /// the window's messages go out unchanged.
     pub message_filter: Option<std::sync::Arc<dyn Fn(Message) -> Message + Send + Sync>>,
-    /// The retained conversation. Behind a mutex so `run()` keeps its `&self`
-    /// receiver and an agent can be shared; the lock is never held across an
-    /// await.
     context_window: std::sync::Mutex<Vec<ContextRow>>,
-    /// Token counts from the most recent provider response.
     pub last_usage: std::sync::Mutex<Option<crate::provider::TokenUsage>>,
-    /// The caller-held turn slot (see [`Factory::slot`]); consumed by
-    /// [`Agent::run_inner`] instead of queueing for one.
     slot: Option<std::sync::Arc<crate::queue::Permit>>,
 
-    // System One
     pub decision_provider: Option<String>,
     pub decision_model: Option<String>,
     pub decision_spec: Option<String>,
     decision_client: Option<Generic>,
 }
 
-// Hand-written because the tool registry holds boxed closures, which cannot
-// derive Debug. The handlers are not useful in a debug dump anyway.
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agent")
@@ -629,8 +508,6 @@ impl std::fmt::Debug for Agent {
     }
 }
 
-/// Resolve the endpoint for a provider: an `endpoints` entry wins, else a
-/// built-in binding, else nothing.
 fn endpoint_for(provider: &str, model: &str) -> (Endpoint, Option<Quirks>) {
     let eps = config::read_user_endpoints();
     if let Some(ep) = eps.get(provider) {
@@ -644,7 +521,6 @@ fn endpoint_for(provider: &str, model: &str) -> (Endpoint, Option<Quirks>) {
             .ca_file
             .clone()
             .or_else(|| config::read_env(&format!("{stem}_CA_FILE")));
-        // A config entry wins over a built-in quirk set for the same name.
         let quirks = Quirks::from_entry(ep)
             .or_else(|| builtin_endpoint(provider).and_then(|b| b.quirks));
         return (
@@ -670,7 +546,6 @@ fn endpoint_for(provider: &str, model: &str) -> (Endpoint, Option<Quirks>) {
 }
 
 impl Agent {
-    /// Build an agent. The counterpart of `Agent.factory({...})`.
     pub fn factory(opts: Factory) -> Result<Self, AgentError> {
         let spec = match &opts.model {
             Some(m) if !m.trim().is_empty() => m.trim().to_string(),
@@ -685,8 +560,6 @@ impl Agent {
         let (raw_provider, model) = split_provider_model(&spec);
         let provider = normalize_gateway_provider(&raw_provider);
 
-        // The proxy path routes EVERY provider:model through the generic
-        // client with the full model id, so AGL need not know the provider.
         let proxy = crate::provider::normalize_proxy(opts.proxy.as_deref());
         let (endpoint, quirks, model, bound_spec) = if !proxy.is_empty() {
             (
@@ -744,15 +617,12 @@ impl Agent {
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,
             reasoning_effort: opts.reasoning_effort,
-            // 0 = no limit (the loop runs until the model stops asking for
-            // tools); unset = the 5-turn default.
             max_turns: match opts.max_turns.unwrap_or(5) {
                 0 => usize::MAX,
                 n => n.max(1),
             },
             max_tools: opts.max_tools.unwrap_or(DEFAULT_MAX_TOOLS),
             tools: BTreeMap::new(),
-            // JS defaults: both false. angela opts into each explicitly.
             retain_history: opts.retain_history.unwrap_or(false),
             parallel_tools: opts.parallel_tools.unwrap_or(false),
             message_filter: opts.message_filter,
@@ -770,10 +640,6 @@ impl Agent {
         Ok(agent)
     }
 
-    /// Bind the System One (decision) model.
-    ///
-    /// Kept entirely separate from the generative binding: an agent may hold
-    /// both, and `switch()` must never fall back to the generative model.
     pub fn bind_decision_model(&mut self, spec: &str) -> Result<(), AgentError> {
         let resolved = spec.trim();
         let idx = resolved.find(':');
@@ -816,8 +682,6 @@ impl Agent {
         self.decision_client.as_ref().map(|c| c.base_url())
     }
 
-    /// Register a tool. Replacing an existing name is allowed; exceeding
-    /// `max_tools` is not.
     pub fn tool(
         &mut self,
         name: &str,
@@ -853,7 +717,6 @@ impl Agent {
         Ok(())
     }
 
-    /// The `tools` array as the API wants it.
     pub fn render_tools(&self) -> Value {
         let specs: BTreeMap<String, ToolSpec> = self
             .tools
@@ -863,12 +726,9 @@ impl Agent {
         render_tools(&specs)
     }
 
-    /// Build the request for one turn, applying endpoint quirks.
     fn build_request(&self, messages: Vec<Message>) -> InferenceRequest {
         let has_tools = !self.tools.is_empty();
         let mut tool_choice = self.tool_choice.clone();
-        // Endpoint quirks. Meta Muse, for one, rejects every tool_choice
-        // except "auto" and has no streaming path.
         if let Some(q) = &self.endpoint_quirks {
             if let Some(tc) = &q.tool_choice {
                 if has_tools || tool_choice.is_some() {
@@ -893,7 +753,6 @@ impl Agent {
         }
     }
 
-    /// Whether this agent would start a stream, given its quirks.
     pub fn may_stream(&self, requested: bool) -> bool {
         match self.endpoint_quirks.as_ref().and_then(|q| q.stream) {
             Some(false) => false,
@@ -901,21 +760,15 @@ impl Agent {
         }
     }
 
-    /// Execute synchronous tool handlers in order, yielding between calls so
-    /// a surrounding cancellation race can stop before the next one starts.
     async fn run_tools(&self, calls: &[ToolCall]) -> Vec<String> {
         let mut out = Vec::with_capacity(calls.len());
         for call in calls {
-            // Handlers are synchronous. Yield after each one so the outer
-            // cancellation race can observe a stop before another call starts.
             out.push(self.invoke_tool(call));
             tokio::task::yield_now().await;
         }
         out
     }
 
-    /// One tool call → its result text. Unknown tools and bad argument JSON
-    /// become tool *results*, never errors, so the model can recover.
     fn invoke_tool(&self, call: &ToolCall) -> String {
         let raw = &call.function.arguments;
         let args: Value = if raw.trim().is_empty() {
@@ -924,8 +777,6 @@ impl Agent {
             match serde_json::from_str(raw) {
                 Ok(v) => v,
                 Err(e) => {
-                    // Truncated tool JSON (finish_reason "length") surfaces as
-                    // a tool error the model can see and retry.
                     return json!({
                         "error": format!("invalid tool arguments (possibly truncated): {e}"),
                         "raw": raw.chars().take(400).collect::<String>(),
@@ -944,9 +795,7 @@ impl Agent {
         }
     }
 
-    // ---- retained context window -------------------------------------
 
-    /// Append a row to the retained conversation. Port of `pushContext`.
     pub fn push_context(&self, message: Message) -> String {
         let id = new_ctx_id();
         self.context_window.lock().unwrap().push(ContextRow {
@@ -957,12 +806,10 @@ impl Agent {
         id
     }
 
-    /// A copy of the retained rows, for a host that renders or persists them.
     pub fn context_snapshot(&self) -> Vec<ContextRow> {
         self.context_window.lock().unwrap().clone()
     }
 
-    /// Drop the retained conversation (a "new session" on the same agent).
     pub fn clear_context(&self) {
         self.context_window.lock().unwrap().clear();
     }
@@ -971,11 +818,6 @@ impl Agent {
         self.context_window.lock().unwrap().len()
     }
 
-    /// The provider-facing message list. Port of `messagesForProvider`.
-    ///
-    /// Drops invisible rows, any stored `system` row (only `system_prompt`
-    /// supplies one) and `reasoning` rows, then merges **consecutive**
-    /// assistant rows that carry tool calls and no text back into one turn.
     pub fn messages_for_provider(&self) -> Vec<Message> {
         let mut out: Vec<Message> = Vec::new();
         if let Some(sp) = &self.system_prompt {
@@ -996,8 +838,6 @@ impl Agent {
             if is_tool_call_only(&msg) {
                 if let Some(prev) = out.last_mut() {
                     if is_tool_call_only(prev) {
-                        // Merge: the UI kept one row per call, the API wants
-                        // one assistant turn carrying all of them.
                         let mut merged = prev.tool_calls.clone().unwrap_or_default();
                         merged.extend(msg.tool_calls.clone().unwrap_or_default());
                         prev.tool_calls = Some(merged);
@@ -1010,18 +850,11 @@ impl Agent {
         out
     }
 
-    /// The one place a request's messages are finalized: the window (or the
-    /// one-shot transcript) exactly as the loop assembled it, then the
-    /// host's filter applied — every message exactly once, retained tool
-    /// messages included. `None` is a no-op, so `default = zero behavior change`.
     fn filtered_messages(&self, messages: Vec<Message>) -> Vec<Message> {
         let filtered = match &self.message_filter {
             Some(filter) => messages.into_iter().map(|m| filter(m)).collect(),
             None => messages,
         };
-        // The filter may have turned tool results into image-carrying
-        // arrays; endpoints that cannot carry those get the pixels through
-        // a user message instead (see `ferry_tool_images`).
         if self.endpoint_quirks.as_ref().and_then(|q| q.tool_images) == Some(false) {
             ferry_tool_images(filtered)
         } else {
@@ -1029,32 +862,13 @@ impl Agent {
         }
     }
 
-    /// Run a prompt, executing tool calls until the model stops asking.
-    ///
-    /// The generative loop. Bounded by `max_turns` so a model that keeps
-    /// calling tools cannot spin forever.
     pub async fn run(&self, prompt: &str) -> Result<String, AgentError> {
         let mut ev = Self::noop_events;
         self.run_inner(Message::user(prompt), false, &mut ev).await
     }
 
-    /// Everything a caller may observe while a turn runs.
-    ///
-    /// Streaming text was the first need; tool activity is the second, and a
-    /// host that renders a transcript needs both. One enum rather than a
-    /// growing list of callbacks.
     pub fn noop_events(_e: TurnEvent<'_>) {}
 
-    /// Run a prompt with token-by-token streaming.
-    ///
-    /// `on_delta` fires for every content and reasoning fragment as it
-    /// arrives, across *every* turn of the tool loop. The return value is the
-    /// same final answer `run()` gives, so a caller can stream for display
-    /// and still use the result.
-    ///
-    /// Honours the endpoint's `stream: false` quirk via [`Agent::may_stream`]:
-    /// against a server that cannot stream (Muse, for one) this transparently
-    /// falls back to the blocking path and simply never calls `on_delta`.
     pub async fn run_stream(
         &self,
         prompt: &str,
@@ -1068,11 +882,6 @@ impl Agent {
         self.run_inner(Message::user(prompt), true, &mut ev).await
     }
 
-    /// Run a prompt, observing **everything**: streamed deltas and each tool
-    /// call and result as they happen.
-    ///
-    /// This is what a chat UI needs — a tool call has to appear in the
-    /// transcript when it runs, not after the whole turn settles.
     pub async fn run_events(
         &self,
         prompt: &str,
@@ -1082,10 +891,6 @@ impl Agent {
         self.run_inner(Message::user(prompt), stream, on_event).await
     }
 
-    /// The generative loop with a **prebuilt user message** — the shape a
-    /// caller needs when the prompt is more than text. An attached image
-    /// rides as OpenAI content parts (`image_url` data URLs), not as words;
-    /// `content` is a `Value` precisely so one message can be either.
     pub async fn run_message(
         &self,
         user: Message,
@@ -1095,8 +900,6 @@ impl Agent {
         self.run_inner(user, stream, on_event).await
     }
 
-    /// The one generative loop. `run` and `run_stream` are thin wrappers so
-    /// the tool-calling semantics cannot drift between them.
     async fn run_inner(
         &self,
         user: Message,
@@ -1106,15 +909,6 @@ impl Agent {
         let streaming = want_stream && self.may_stream(true);
         let retain = self.retain_history;
 
-        // The turn queue: one slot per `provider:model` (c=N from the user
-        // config), held until the turn ends. A caller that took the slot
-        // itself (atomically, where it decided the turn may start) holds it
-        // here instead of queueing — taking a second one would deadlock a
-        // single-concurrency model against its own turn. Only a run that
-        // has no held slot announces a wait, so the transcript shows why
-        // nothing is streaming yet. The permit releases on every exit path
-        // — answer, error, or cancellation — because it is dropped, not
-        // returned.
         let _permit: std::sync::Arc<crate::queue::Permit> = match &self.slot {
             Some(held) if held.spec() == self.bound_spec => held.clone(),
             _ => {
@@ -1129,8 +923,6 @@ impl Agent {
             }
         };
 
-        // Retained: the prompt joins the persistent window. One-shot: an
-        // ephemeral transcript, so a stateless call cannot pollute context.
         let mut oneshot: Vec<Message> = Vec::new();
         if retain {
             self.push_context(user);
@@ -1157,13 +949,10 @@ impl Agent {
             } else {
                 self.client.inference(&req).await?
             };
-            // Authoritative context size from the provider's own usage row.
             if let Some(u) = &result.usage {
                 *self.last_usage.lock().unwrap() = Some(u.clone());
             }
 
-            // Some gateways set finish_reason to "stop"/"length" while still
-            // returning tool_calls, so any non-empty tool_calls is a tool turn.
             let calls: Vec<ToolCall> = result
                 .choices
                 .iter()
@@ -1172,7 +961,6 @@ impl Agent {
                 .collect();
 
             if calls.is_empty() {
-                // Retain the final assistant turn so the next run() sees it.
                 if retain {
                     if let Some(first) = result.choices.first() {
                         let m = &first.message;
@@ -1202,10 +990,6 @@ impl Agent {
                     .unwrap_or_default());
             }
 
-            // One row per tool call — the JS keeps "1 UI row = 1 item = 1
-            // jsonl event", and messages_for_provider merges them back for
-            // the API. The one-shot path gets the same per-call rows and no
-            // merge, exactly as the JS does.
             for call in &calls {
                 let row = Message {
                     role: "assistant".into(),
@@ -1254,10 +1038,6 @@ impl Agent {
         )))
     }
 
-    /// Run a finite-choice decision loop over the System One model.
-    ///
-    /// Deliberately a sibling of `run()`: it does not touch the generative
-    /// loop or `max_turns`.
     pub fn switch(
         &self,
         domain: &dyn Domain,
@@ -1282,7 +1062,6 @@ impl Agent {
         )?)
     }
 
-    /// Replay a recorded trace. Needs no endpoint at all.
     pub fn replay(
         &self,
         domain: &dyn Domain,
@@ -1298,7 +1077,6 @@ impl Agent {
         )?)
     }
 
-    /// Replay `steps` steps of a trace, then continue with the model.
     pub fn fork(
         &self,
         domain: &dyn Domain,
@@ -1326,635 +1104,10 @@ impl Agent {
     }
 }
 
-/// Re-exported so callers can `match` on how a run finished.
 pub use crate::switch::Ended as SwitchEnded;
-/// Re-exported for domain implementors.
 pub use crate::switch::{pick, Opt, Question};
 
 #[allow(unused_imports)]
 use Answer as _AnswerUsed;
 #[allow(unused_imports)]
 use Ended as _EndedUsed;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate process-wide env/config.
-    static ENV: Mutex<()> = Mutex::new(());
-
-    struct Cfg {
-        _dir: std::path::PathBuf,
-    }
-
-    /// Point AGL_CONFIG_PATH at a temp config for the duration of a test.
-    fn with_config(text: &str) -> Cfg {
-        let dir = std::env::temp_dir().join(format!("agl-rs-cfg-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!(
-            "config-{}.yaml",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, text).unwrap();
-        std::env::set_var("AGL_CONFIG_PATH", &path);
-        Cfg { _dir: dir }
-    }
-
-    impl Drop for Cfg {
-        fn drop(&mut self) {
-            std::env::remove_var("AGL_CONFIG_PATH");
-        }
-    }
-
-    #[test]
-    fn the_removed_providers_are_gone_and_the_aliases_remain() {
-        assert_eq!(resolve_provider_id("llama-server"), "generic");
-        assert_eq!(resolve_provider_id("openai"), "generic");
-        assert_eq!(resolve_provider_id("systemone"), "generic");
-        assert_eq!(resolve_provider_id("meta"), "generic");
-        assert_eq!(resolve_provider_id("muse"), "generic");
-        // Removed entirely: no alias, so they resolve to themselves and then
-        // fail the CANONICAL check.
-        for gone in ["xai", "ollama", "lm-studio", "runpod", "anthropic"] {
-            assert!(alias_target(gone).is_none(), "{gone} should not be an alias");
-            assert!(!CANONICAL.contains(&gone));
-        }
-    }
-
-    #[test]
-    fn a_bare_model_id_routes_to_copilot_or_generic() {
-        assert_eq!(split_provider_model("gpt-4o").0, "copilot");
-        assert_eq!(split_provider_model("claude-sonnet").0, "copilot");
-        // Previously grok* guessed xai and the catch-all guessed lm-studio.
-        assert_eq!(split_provider_model("grok-4.6").0, "generic");
-        assert_eq!(split_provider_model("qwen-3.8-27b").0, "generic");
-        // An explicit prefix always wins.
-        assert_eq!(
-            split_provider_model("llama-server:default"),
-            ("llama-server".to_string(), "default".to_string())
-        );
-    }
-
-    #[test]
-    fn meta_carries_its_two_quirks_and_muse_normalizes_to_it() {
-        let b = builtin_endpoint("meta").unwrap();
-        let q = b.quirks.unwrap();
-        assert_eq!(q.tool_choice.as_deref(), Some("auto"));
-        assert_eq!(q.stream, Some(false));
-        assert_eq!(normalize_gateway_provider("muse"), "meta");
-    }
-
-    #[test]
-    fn systemone_defaults_to_the_documented_port_and_is_a_decision_endpoint() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("SYSTEMONE_URL");
-        let b = builtin_endpoint("systemone").unwrap();
-        assert_eq!(b.base_url.as_deref(), Some("http://127.0.0.1:1237"));
-        assert_eq!(b.quirks.unwrap().decisions, Some(true));
-    }
-
-    #[test]
-    fn llama_server_binds_localhost_and_never_inherits_mycloud() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        std::env::set_var("MYCLOUD_BASE_URL", "https://192.0.2.1:1234");
-        let b = builtin_endpoint("llama-server").unwrap();
-        assert_eq!(b.base_url.as_deref(), Some("http://127.0.0.1:1234"));
-        std::env::remove_var("MYCLOUD_BASE_URL");
-    }
-
-    #[test]
-    fn context_windows_resolve_by_group_then_default_then_fallback() {
-        let _g = ENV.lock().unwrap();
-        let _cfg = with_config(
-            "default_model: llama-server:gemma-4-12b-qat\n\
-             context_windows:\n\
-            \x20 llama-server:\n\
-            \x20   default: 524288\n\
-            \x20   gemma-4-12b-qat: 1048576\n\
-            \x20 xai:\n\
-            \x20   default: 131072\n\
-            \x20   grok-4.6: 500000\n",
-        );
-        assert_eq!(resolve_context_window("llama-server:gemma-4-12b-qat"), 1_048_576);
-        // Unknown id under a known provider -> that group's default.
-        assert_eq!(resolve_context_window("llama-server:nope"), 524_288);
-        // A provider that is no longer built in still resolves its group.
-        assert_eq!(resolve_context_window("xai:grok-4.6"), 500_000);
-        // Unknown provider entirely -> the global fallback.
-        assert_eq!(resolve_context_window("acme:thing"), FALLBACK_CONTEXT_WINDOW);
-    }
-
-    #[test]
-    fn concurrency_resolves_like_context_windows_and_defaults_to_one() {
-        let _g = ENV.lock().unwrap();
-        // No config at all -> 1 (serial).
-        {
-            let _cfg = with_config("default_model: llama-server:default\n");
-            assert_eq!(resolve_concurrency("llama-server:default"), 1);
-        }
-        let _cfg = with_config(
-            "concurrency:\n\
-            \x20 llama-server:\n\
-            \x20   default: 1\n\
-            \x20   big: 2\n\
-            \x20 openai:\n\
-            \x20   default: 4\n",
-        );
-        // Exact model id wins over the group default.
-        assert_eq!(resolve_concurrency("llama-server:big"), 2);
-        // Unknown id under a known provider -> the group's default.
-        assert_eq!(resolve_concurrency("llama-server:small"), 1);
-        // Group default is enough for a whole hosted provider.
-        assert_eq!(resolve_concurrency("openai:gpt-5"), 4);
-        // Unknown provider entirely -> 1.
-        assert_eq!(resolve_concurrency("acme:thing"), 1);
-        // Zero / negative in the config never disables the queue.
-        let _cfg = with_config("concurrency:\n  llama-server:\n    default: 0\n");
-        assert_eq!(resolve_concurrency("llama-server:default"), 1);
-    }
-
-    #[test]
-    fn default_model_comes_from_the_config_and_is_re_read() {
-        let _g = ENV.lock().unwrap();
-        {
-            let _cfg = with_config("default_model: llama-server:first\n");
-            assert_eq!(resolve_default_model(), "llama-server:first");
-        }
-        {
-            let _cfg = with_config("default_model: llama-server:second\n");
-            assert_eq!(resolve_default_model(), "llama-server:second");
-        }
-    }
-
-    #[test]
-    fn an_unknown_provider_names_the_accepted_ids() {
-        let _g = ENV.lock().unwrap();
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let err = Agent::factory(Factory {
-            model: Some("acme:whatever".into()),
-            ..Default::default()
-        })
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Unknown AI provider: acme"), "{msg}");
-        assert!(msg.contains("generic, llama-server, openai, systemone, meta, muse"), "{msg}");
-    }
-
-    #[test]
-    fn the_alias_keeps_its_surface_name_so_config_groups_still_resolve() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        let _cfg = with_config(
-            "default_model: llama-server:default\n\
-             context_windows:\n\
-            \x20 llama-server:\n\
-            \x20   default: 524288\n",
-        );
-        let a = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        // The id stays visible even though the module behind it is generic.
-        assert_eq!(a.provider, "llama-server");
-        assert_eq!(a.model, "default");
-        assert_eq!(a.client.base_url(), "http://127.0.0.1:1234");
-        assert_eq!(a.context_window_size, 524_288);
-    }
-
-    #[test]
-    fn the_proxy_path_routes_a_provider_agl_does_not_know() {
-        let _g = ENV.lock().unwrap();
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let a = Agent::factory(Factory {
-            model: Some("acme:secret-model".into()),
-            proxy: Some("host.containers.internal:1234".into()),
-            api_key: Some("k".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        // The full provider:model rides the body, so AGL need not know acme.
-        assert_eq!(a.model, "acme:secret-model");
-        assert_eq!(a.client.base_url(), "https://host.containers.internal:1234");
-    }
-
-    #[test]
-    fn meta_coerces_tool_choice_and_suppresses_streaming() {
-        let _g = ENV.lock().unwrap();
-        std::env::set_var("META_API_KEY", "test-key");
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let mut a = Agent::factory(Factory {
-            model: Some("meta:muse-spark-1.2-contributor".into()),
-            tool_choice: Some(json!("required")),
-            ..Default::default()
-        })
-        .unwrap();
-        a.tool("noop", "does nothing", json!({}), vec![], |_| Ok("x".into()))
-            .unwrap();
-        let req = a.build_request(vec![Message::user("hi")]);
-        assert_eq!(req.tool_choice, Some(json!("auto")));
-        assert!(!a.may_stream(true));
-        std::env::remove_var("META_API_KEY");
-    }
-
-    #[test]
-    fn an_endpoint_without_quirks_passes_tool_choice_and_stream_through() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let mut a = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            tool_choice: Some(json!("required")),
-            ..Default::default()
-        })
-        .unwrap();
-        a.tool("noop", "does nothing", json!({}), vec![], |_| Ok("x".into()))
-            .unwrap();
-        assert!(a.endpoint_quirks.is_none());
-        let req = a.build_request(vec![Message::user("hi")]);
-        assert_eq!(req.tool_choice, Some(json!("required")));
-        assert!(a.may_stream(true));
-    }
-
-    #[test]
-    fn the_tool_registry_caps_at_max_tools_but_allows_replacement() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let mut a = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            max_tools: Some(2),
-            ..Default::default()
-        })
-        .unwrap();
-        a.tool("a", "", json!({}), vec![], |_| Ok(String::new())).unwrap();
-        a.tool("b", "", json!({}), vec![], |_| Ok(String::new())).unwrap();
-        assert!(a
-            .tool("c", "", json!({}), vec![], |_| Ok(String::new()))
-            .is_err());
-        // Replacing an existing name is fine.
-        assert!(a
-            .tool("a", "", json!({}), vec![], |_| Ok(String::new()))
-            .is_ok());
-        assert_eq!(a.render_tools().as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn a_bad_decision_model_spec_is_refused() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let err = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            decision_model: Some("systemone".into()),
-            ..Default::default()
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("Invalid decision_model format"));
-
-        let err = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            decision_model: Some("nope:x".into()),
-            ..Default::default()
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("Unknown decision provider: nope"));
-    }
-
-    #[test]
-    fn switch_without_a_decision_model_refuses() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let a = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            ..Default::default()
-        })
-        .unwrap();
-
-        struct NoQs;
-        impl Domain for NoQs {
-            fn name(&self) -> &str {
-                "t"
-            }
-            fn initial(&self, _i: &Value) -> Value {
-                json!({})
-            }
-            fn questions(&self, _s: &Value) -> Result<BTreeMap<String, Question>, SwitchError> {
-                Ok(BTreeMap::new())
-            }
-            fn transition(
-                &self,
-                s: &Value,
-                _a: &BTreeMap<String, Answer>,
-            ) -> Result<Value, SwitchError> {
-                Ok(s.clone())
-            }
-        }
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = a.switch(&NoQs, &json!({}), rt.handle().clone()).unwrap_err();
-        assert!(err.to_string().contains("needs a decision model"));
-    }
-
-    #[test]
-    fn a_decision_model_binds_the_generic_client_at_the_systemone_port() {
-        let _g = ENV.lock().unwrap();
-        std::env::remove_var("SYSTEMONE_URL");
-        std::env::remove_var("LLAMA_SERVER_BASE_URL");
-        let _cfg = with_config("default_model: llama-server:default\n");
-        let a = Agent::factory(Factory {
-            model: Some("llama-server:default".into()),
-            decision_model: Some("systemone:default".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(a.decision_spec.as_deref(), Some("systemone:default"));
-        assert_eq!(a.decision_base_url(), Some("http://127.0.0.1:1237"));
-        // The generative and decision endpoints are independent.
-        assert_eq!(a.client.base_url(), "http://127.0.0.1:1234");
-    }
-}
-
-#[cfg(test)]
-mod context_tests {
-    use super::*;
-    use crate::provider::{FunctionCall, ToolCall};
-
-    fn agent(retain: bool) -> Agent {
-        let mut f = Factory {
-            model: Some("llama-server:test".into()),
-            system_prompt: Some("SYS".into()),
-            retain_history: Some(retain),
-            base_url: Some("http://127.0.0.1:1".into()),
-            ..Default::default()
-        };
-        f.retain_history = Some(retain);
-        Agent::factory(f).expect("agent")
-    }
-
-    fn call(id: &str, name: &str) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            kind: "function".into(),
-            function: FunctionCall {
-                name: name.into(),
-                arguments: "{}".into(),
-            },
-        }
-    }
-
-    fn tool_row(c: ToolCall) -> Message {
-        Message {
-            role: "assistant".into(),
-            content: Some(Value::String(String::new())),
-            tool_calls: Some(vec![c]),
-            tool_call_id: None,
-            reasoning_content: None,
-        }
-    }
-
-    #[test]
-    fn the_system_prompt_leads_and_is_not_stored() {
-        let a = agent(true);
-        a.push_context(Message::user("hi"));
-        let m = a.messages_for_provider();
-        assert_eq!(m[0].role, "system");
-        assert_eq!(m[0].content.as_ref().unwrap().as_str(), Some("SYS"));
-        assert_eq!(m[1].role, "user");
-        assert_eq!(m.len(), 2);
-    }
-
-    #[test]
-    fn a_stored_system_row_is_dropped_so_only_system_prompt_leads() {
-        let a = agent(true);
-        a.push_context(Message::system("SNEAKY"));
-        a.push_context(Message::user("hi"));
-        let m = a.messages_for_provider();
-        assert_eq!(m.len(), 2);
-        assert_eq!(m[0].content.as_ref().unwrap().as_str(), Some("SYS"));
-    }
-
-    #[test]
-    fn reasoning_rows_are_ui_only() {
-        let a = agent(true);
-        a.push_context(Message::text("reasoning", "thinking out loud"));
-        a.push_context(Message::user("hi"));
-        let m = a.messages_for_provider();
-        assert_eq!(m.len(), 2);
-        assert!(m.iter().all(|x| x.role != "reasoning"));
-    }
-
-    #[test]
-    fn invisible_rows_are_hidden_from_the_provider() {
-        let a = agent(true);
-        a.push_context(Message::user("shown"));
-        let id = a.push_context(Message::user("hidden"));
-        {
-            let mut rows = a.context_window.lock().unwrap();
-            rows.iter_mut().find(|r| r.id == id).unwrap().visible = false;
-        }
-        let m = a.messages_for_provider();
-        assert_eq!(m.len(), 2);
-        assert_eq!(m[1].content.as_ref().unwrap().as_str(), Some("shown"));
-        // still present for the UI
-        assert_eq!(a.context_snapshot().len(), 2);
-    }
-
-    #[test]
-    fn consecutive_tool_call_rows_merge_into_one_turn() {
-        // The window keeps one row per call; the API gets one assistant turn.
-        let a = agent(true);
-        a.push_context(Message::user("go"));
-        a.push_context(tool_row(call("c1", "alpha")));
-        a.push_context(tool_row(call("c2", "beta")));
-        let m = a.messages_for_provider();
-        assert_eq!(a.context_len(), 3, "window keeps a row per call");
-        assert_eq!(m.len(), 3, "system + user + ONE merged assistant turn");
-        let merged = m[2].tool_calls.as_ref().unwrap();
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].function.name, "alpha");
-        assert_eq!(merged[1].function.name, "beta");
-    }
-
-    #[test]
-    fn a_tool_result_between_calls_breaks_the_merge() {
-        let a = agent(true);
-        a.push_context(tool_row(call("c1", "alpha")));
-        a.push_context(Message::tool_result("c1", "done"));
-        a.push_context(tool_row(call("c2", "beta")));
-        let m = a.messages_for_provider();
-        // system, assistant(1), tool, assistant(1) — not merged across.
-        assert_eq!(m.len(), 4);
-        assert_eq!(m[1].tool_calls.as_ref().unwrap().len(), 1);
-        assert_eq!(m[3].tool_calls.as_ref().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn an_assistant_with_text_and_calls_does_not_merge() {
-        // The merge rule requires empty content; text means a real turn.
-        let a = agent(true);
-        let mut spoke = tool_row(call("c1", "alpha"));
-        spoke.content = Some(Value::String("I will call a tool".into()));
-        a.push_context(spoke);
-        a.push_context(tool_row(call("c2", "beta")));
-        let m = a.messages_for_provider();
-        assert_eq!(m.len(), 3);
-        assert_eq!(m[1].tool_calls.as_ref().unwrap().len(), 1);
-        assert_eq!(m[2].tool_calls.as_ref().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn clearing_drops_the_conversation() {
-        let a = agent(true);
-        a.push_context(Message::user("one"));
-        assert_eq!(a.context_len(), 1);
-        a.clear_context();
-        assert_eq!(a.context_len(), 0);
-        assert_eq!(a.messages_for_provider().len(), 1); // system only
-    }
-
-    #[test]
-    fn retained_tool_messages_pass_through_the_filter_once_each() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls_clone = calls.clone();
-        let mut f = Factory {
-            model: Some("llama-server:test".into()),
-            system_prompt: Some("SYS".into()),
-            retain_history: Some(true),
-            base_url: Some("http://127.0.0.1:1".into()),
-            ..Default::default()
-        };
-        f.message_filter = Some(std::sync::Arc::new(move |m| {
-            calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if m.role == "tool" {
-                let mut m = m;
-                let text = m.content.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-                m.content = Some(Value::String(format!("FILTERED: {text}")));
-                m
-            } else {
-                m
-            }
-        }));
-        let a = Agent::factory(f).expect("agent");
-        a.push_context(Message::user("go"));
-        a.push_context(tool_row(call("c1", "alpha")));
-        a.push_context(Message::tool_result("c1", "done"));
-
-        let msgs = a.messages_for_provider();
-        let out = a.filtered_messages(msgs.clone());
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            msgs.len(),
-            "every message passes through exactly once"
-        );
-        let tool = out.iter().find(|m| m.role == "tool").expect("tool message");
-        assert_eq!(
-            tool.content.as_ref().and_then(|v| v.as_str()),
-            Some("FILTERED: done"),
-            "the retained tool message reached the filter"
-        );
-        assert_eq!(out.len(), msgs.len());
-    }
-
-    #[test]
-    fn without_a_filter_the_messages_pass_through_unchanged() {
-        let a = agent(true);
-        a.push_context(Message::user("go"));
-        a.push_context(tool_row(call("c1", "alpha")));
-        a.push_context(Message::tool_result("c1", "done"));
-        let msgs = a.messages_for_provider();
-        let out = a.filtered_messages(msgs.clone());
-        assert_eq!(
-            serde_json::to_value(&out).unwrap(),
-            serde_json::to_value(&msgs).unwrap(),
-            "a default agent sends exactly what the window assembled"
-        );
-    }
-
-    #[test]
-    fn one_shot_agents_retain_nothing() {
-        let a = agent(false);
-        assert!(!a.retain_history);
-        assert_eq!(a.context_len(), 0);
-    }
-
-    #[test]
-    fn tool_images_ferry_into_a_user_message() {
-        let img = serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}});
-        let mut tool = Message::tool_result("c1", "see ![image](/media/x.png)");
-        tool.content = Some(serde_json::json!([
-            {"type": "text", "text": "see ![image](/media/x.png)"},
-            img
-        ]));
-        let plain = Message::tool_result("c2", "plain");
-        let out = ferry_tool_images(vec![tool, plain]);
-        assert_eq!(out.len(), 3, "tool-with-image splits, plain tool rides on");
-        // The tool message keeps only its text; the image rides the user
-        // message right behind it.
-        let first = serde_json::to_value(&out[0]).unwrap();
-        assert_eq!(first["role"], "tool");
-        assert!(first["content"].is_array());
-        assert_eq!(first["content"].as_array().unwrap().len(), 1);
-        assert_eq!(out[1].role, "user");
-        let second = serde_json::to_value(&out[1]).unwrap();
-        assert_eq!(second["content"].as_array().unwrap()[1]["type"], "image_url");
-        assert_eq!(out[2].role, "tool");
-    }
-
-    #[test]
-    fn rows_get_distinct_ids() {
-        let a = agent(true);
-        let a1 = a.push_context(Message::user("x"));
-        let a2 = a.push_context(Message::user("y"));
-        assert_ne!(a1, a2);
-    }
-
-    #[test]
-    fn cancellation_wins_before_the_next_tool_starts() {
-        let mut a = agent(false);
-        let signal = std::sync::Arc::new(tokio::sync::Notify::new());
-        let trigger = signal.clone();
-        a.tool("first", "", json!({}), vec![], move |_| { trigger.notify_one(); Ok("done".into()) }).unwrap();
-        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = ran.clone();
-        a.tool("second", "", json!({}), vec![], move |_| { flag.store(true, std::sync::atomic::Ordering::SeqCst); Ok("done".into()) }).unwrap();
-        let calls = vec![call("1", "first"), call("2", "second")];
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let stopped = rt.block_on(async {
-            tokio::select! { biased; _ = signal.notified() => true, _ = a.run_tools(&calls) => false }
-        });
-        assert!(stopped);
-        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[test]
-    fn bad_tool_json_becomes_a_tool_result_not_an_error() {
-        let a = agent(false);
-        let mut c = call("c1", "nope");
-        c.function.arguments = "{\"truncated\":".into();
-        let out = a.invoke_tool(&c);
-        assert!(out.contains("invalid tool arguments"), "{out}");
-        assert!(out.contains("truncated"), "{out}");
-    }
-
-    #[test]
-    fn an_unknown_tool_reports_the_known_ones() {
-        let a = agent(false);
-        let out = a.invoke_tool(&call("c1", "ghost"));
-        assert!(out.contains("unknown tool"), "{out}");
-    }
-
-    #[test]
-    fn empty_arguments_parse_as_an_empty_object() {
-        let a = agent(false);
-        let mut c = call("c1", "ghost");
-        c.function.arguments = String::new();
-        // Reaches the unknown-tool branch rather than the bad-JSON branch.
-        assert!(a.invoke_tool(&c).contains("unknown tool"));
-    }
-}

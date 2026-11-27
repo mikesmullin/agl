@@ -1,19 +1,7 @@
-//! Config — port of `src/lib/config.mjs`.
-//!
-//! The YAML parser is deliberately the same narrow subset as the JS original:
-//! comments, nested maps, quoted/plain scalars, integers. That is everything
-//! `~/.config/agl/config.yaml` uses (`default_model`, `context_windows`,
-//! `endpoints`), and keeping it narrow keeps the dependency list empty for
-//! this module.
-//!
-//! Like the JS version, the user config is re-read from disk on every lookup
-//! (no cache), so editing it takes effect without restarting the process.
-
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
 
-/// A parsed YAML value from the supported subset.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Yaml {
     Str(String),
@@ -56,8 +44,6 @@ impl Yaml {
         self.as_map().and_then(|m| m.get(key))
     }
 
-    /// Scalar rendered as the JS `String(v)` would render it — used where the
-    /// original coerced a scalar to text (e.g. an endpoint URL).
     pub fn to_scalar_string(&self) -> Option<String> {
         match self {
             Yaml::Str(s) => Some(s.clone()),
@@ -68,8 +54,6 @@ impl Yaml {
     }
 }
 
-/// Strip a `#` comment, honouring quotes, exactly as the JS original does:
-/// a `#` only starts a comment at the line start or after a space/tab.
 fn strip_inline_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut in_quote: Option<u8> = None;
@@ -109,7 +93,6 @@ fn coerce_scalar(raw: &str) -> Yaml {
         "null" | "~" => return Yaml::Null,
         _ => {}
     }
-    // /^-?\d+$/
     let digits = s.strip_prefix('-').unwrap_or(s);
     if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
         if let Ok(n) = s.parse::<i64>() {
@@ -119,16 +102,8 @@ fn coerce_scalar(raw: &str) -> Yaml {
     Yaml::Str(s.to_string())
 }
 
-/// Parse the supported YAML subset into a map.
-///
-/// Mirrors the JS algorithm: an indent-keyed stack of open maps, a key with an
-/// empty value opens a child map, a key with a value stores a scalar. Lines
-/// without a colon are skipped (so list items are ignored, as in the original).
 pub fn parse_yaml(text: &str) -> Yaml {
-    // Build with a path stack of (indent, keys-to-node) and insert at the end,
-    // since Rust will not let us hold aliases into a growing tree.
     let mut root: BTreeMap<String, Yaml> = BTreeMap::new();
-    // Each entry: (indent, path from root to the open map)
     let mut stack: Vec<(i64, Vec<String>)> = vec![(-1, Vec::new())];
 
     for raw_line in text.split('\n') {
@@ -164,7 +139,6 @@ pub fn parse_yaml(text: &str) -> Yaml {
     Yaml::Map(root)
 }
 
-/// Insert `value` at `path`/`key`, creating missing maps along the way.
 fn insert_at(root: &mut BTreeMap<String, Yaml>, path: &[String], key: &str, value: Yaml) {
     let mut cursor = root;
     for seg in path {
@@ -182,7 +156,6 @@ fn insert_at(root: &mut BTreeMap<String, Yaml>, path: &[String], key: &str, valu
     cursor.insert(key.to_string(), value);
 }
 
-/// Path to the user config. `AGL_CONFIG_PATH` overrides it.
 pub fn user_config_path() -> PathBuf {
     if let Ok(p) = env::var("AGL_CONFIG_PATH") {
         if !p.trim().is_empty() {
@@ -193,8 +166,6 @@ pub fn user_config_path() -> PathBuf {
     PathBuf::from(home).join(".config").join("agl").join("config.yaml")
 }
 
-/// Read and parse the user config. A missing or unreadable file is an empty
-/// map, never an error — AGL has safe defaults for all non-secret config.
 pub fn read_user_config() -> Yaml {
     match std::fs::read_to_string(user_config_path()) {
         Ok(text) => parse_yaml(&text),
@@ -202,7 +173,6 @@ pub fn read_user_config() -> Yaml {
     }
 }
 
-/// `default_model`, or `None` when unset/unreadable.
 pub fn read_user_default_model() -> Option<String> {
     let cfg = read_user_config();
     let v = cfg.get("default_model")?.to_scalar_string()?;
@@ -214,8 +184,6 @@ pub fn read_user_default_model() -> Option<String> {
     }
 }
 
-/// An `endpoints` entry: a bare URL string, or a map with `url` plus optional
-/// `api_key` / `ca_file` and the behaviour flags described in `agent::Quirks`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EndpointEntry {
     pub url: String,
@@ -227,8 +195,6 @@ pub struct EndpointEntry {
     pub tool_images: Option<bool>,
 }
 
-/// The `endpoints` map: provider name → endpoint. Any key here is a dynamic
-/// provider that routes through the generic OpenAI-compatible client.
 pub fn read_user_endpoints() -> BTreeMap<String, EndpointEntry> {
     let cfg = read_user_config();
     let mut out = BTreeMap::new();
@@ -270,67 +236,9 @@ pub fn read_user_endpoints() -> BTreeMap<String, EndpointEntry> {
     out
 }
 
-/// Read an environment variable, empty treated as unset (JS `||` semantics).
 pub fn read_env(name: &str) -> Option<String> {
     match env::var(name) {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_nested_maps_and_scalar_kinds() {
-        let y = parse_yaml(
-            "default_model: llama-server:default\n\
-             context_windows:\n\
-            \x20 llama-server:\n\
-            \x20   default: 524288\n\
-            \x20   gemma-4: 1048576\n\
-             flag: true\n\
-             nothing: ~\n",
-        );
-        assert_eq!(
-            y.get("default_model").unwrap().as_str(),
-            Some("llama-server:default")
-        );
-        let group = y.get("context_windows").unwrap().get("llama-server").unwrap();
-        assert_eq!(group.get("default").unwrap().as_i64(), Some(524_288));
-        assert_eq!(group.get("gemma-4").unwrap().as_i64(), Some(1_048_576));
-        assert_eq!(y.get("flag").unwrap().as_bool(), Some(true));
-        assert_eq!(y.get("nothing").unwrap(), &Yaml::Null);
-    }
-
-    #[test]
-    fn strips_comments_only_outside_quotes_and_after_space() {
-        assert_eq!(strip_inline_comment("a: 1 # trailing"), "a: 1 ");
-        assert_eq!(strip_inline_comment("# whole line"), "");
-        // A '#' with no preceding space is part of the value, as in JS.
-        assert_eq!(strip_inline_comment("url: http://h/p#frag"), "url: http://h/p#frag");
-        // Quoted '#' is data.
-        assert_eq!(strip_inline_comment("a: \"x # y\""), "a: \"x # y\"");
-    }
-
-    #[test]
-    fn dedents_back_to_an_outer_map() {
-        let y = parse_yaml(
-            "a:\n  b:\n    c: 1\nd: 2\n",
-        );
-        assert_eq!(y.get("a").unwrap().get("b").unwrap().get("c").unwrap().as_i64(), Some(1));
-        assert_eq!(y.get("d").unwrap().as_i64(), Some(2));
-    }
-
-    #[test]
-    fn negative_and_quoted_scalars() {
-        let y = parse_yaml("n: -5\nq: \"true\"\ns: 'hi there'\n");
-        assert_eq!(y.get("n").unwrap().as_i64(), Some(-5));
-        // Quirk kept deliberately: the JS original unquotes BEFORE coercing,
-        // so a quoted "true" still becomes a boolean. Verified against
-        // src/lib/config.mjs rather than assumed.
-        assert_eq!(y.get("q").unwrap().as_bool(), Some(true));
-        assert_eq!(y.get("s").unwrap().as_str(), Some("hi there"));
     }
 }

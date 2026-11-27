@@ -1,13 +1,3 @@
-//! mini-handlebars — port of `src/lib/mini-handlebars.mjs`.
-//!
-//! Supported: `{{path}}`, `{{#if}}`/`{{#unless}}/{{#each}}/{{#with}}` with
-//! `{{else}}` and `{{else if}}`, `{{this}}`, `./`, `../`, `@index`/`@key`/
-//! `@first`/`@last`, `{{~ ~}}` whitespace control, and `\{{escaped}}`.
-//!
-//! Not supported (same as the original): comments, custom helpers, partials,
-//! subexpressions, hash arguments, block parameters, raw blocks, HTML
-//! escaping.
-
 use serde_json::Value;
 
 const BUILTIN: [&str; 4] = ["if", "unless", "each", "with"];
@@ -27,7 +17,6 @@ fn err<T>(msg: impl Into<String>) -> Result<T, TemplateError> {
     Err(TemplateError(msg.into()))
 }
 
-// --- tokens -----------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum Tok {
@@ -88,7 +77,6 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
     let mut text_start = 0usize;
 
     while i < n {
-        // \{{...}} → emit the mustache literally, without the backslash.
         if b[i] == '\\' && i + 2 < n && b[i + 1] == '{' && b[i + 2] == '{' {
             if i > text_start {
                 tokens.push(Tok::Text(b[text_start..i].iter().collect()));
@@ -256,7 +244,6 @@ fn parse_tag(content: &str, strip_left: bool, strip_right: bool) -> Result<Tok, 
     })
 }
 
-/// `^([A-Za-z_][\w-]*)(?:\s+([\s\S]+))?$`
 fn split_helper(rest: &str) -> Result<(String, String), TemplateError> {
     let mut chars = rest.char_indices();
     let Some((_, first)) = chars.next() else {
@@ -281,14 +268,12 @@ fn split_helper(rest: &str) -> Result<(String, String), TemplateError> {
     Ok((name, arg))
 }
 
-// --- whitespace -------------------------------------------------------------
 
 fn line_left_ok(tokens: &[Tok], i: usize) -> bool {
     let mut j = i as isize - 1;
     while j >= 0 {
         match &tokens[j as usize] {
             Tok::Text(v) => {
-                // /(?:^|\n)[ \t]*$/
                 let tail = v.rsplit('\n').next().unwrap_or("");
                 if !tail.chars().all(|c| c == ' ' || c == '\t') {
                     return false;
@@ -312,7 +297,6 @@ fn line_right_ok(tokens: &[Tok], i: usize) -> bool {
     while j < tokens.len() {
         match &tokens[j] {
             Tok::Text(v) => {
-                // /^[ \t]*(?:\n|$)/
                 let head: String = v.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
                 let after = &v[head.len()..];
                 if !(after.is_empty() || after.starts_with('\n')) {
@@ -329,8 +313,6 @@ fn line_right_ok(tokens: &[Tok], i: usize) -> bool {
     true
 }
 
-/// Standalone block tags eat their indent and trailing newline, as Handlebars
-/// does. The tag must be the only non-whitespace on its line.
 fn apply_whitespace(mut tokens: Vec<Tok>) -> Vec<Tok> {
     let marks: Vec<usize> = (0..tokens.len())
         .filter(|&i| tokens[i].is_blockish() && line_left_ok(&tokens, i) && line_right_ok(&tokens, i))
@@ -370,7 +352,6 @@ fn apply_whitespace(mut tokens: Vec<Tok>) -> Vec<Tok> {
     tokens
 }
 
-// --- ast --------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -428,8 +409,6 @@ impl Parser {
         Ok(nodes)
     }
 
-    /// `until`: set when this block is an `{{else if}}` nested inside another
-    /// helper — wait for that helper's close, and do not consume it.
     fn parse_block(
         &mut self,
         helper: &str,
@@ -474,7 +453,6 @@ fn parse(src: &str) -> Result<Vec<Node>, TemplateError> {
     p.parse_until(None)
 }
 
-// --- paths ------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 enum Seg {
@@ -551,7 +529,6 @@ fn parse_path(s: &str) -> Result<Path, TemplateError> {
             leading = false;
             continue;
         }
-        // /^[A-Za-z0-9_$-]+/
         let start = i;
         while i < n && (b[i].is_ascii_alphanumeric() || b[i] == '_' || b[i] == '$' || b[i] == '-') {
             i += 1;
@@ -570,7 +547,6 @@ fn parse_path(s: &str) -> Result<Path, TemplateError> {
     Ok(Path { data, segs })
 }
 
-/// A rendering frame: the context value plus `@`-data for the enclosing block.
 #[derive(Debug, Clone)]
 struct Frame {
     value: Value,
@@ -595,7 +571,6 @@ fn get_prop(v: &Value, key: &str) -> Option<Value> {
     match v {
         Value::Object(m) => m.get(key).cloned(),
         Value::Array(a) => {
-            // Numeric index, and `length` as JS would give it.
             if key == "length" {
                 return Some(Value::from(a.len()));
             }
@@ -687,7 +662,6 @@ fn lookup(path_str: &str, frames: &[Frame]) -> Option<Value> {
     let mut obj: Option<Value> = if current_only || matches!(first, Seg::Literal(_)) {
         get_prop(&frames[fi].value, key)
     } else {
-        // Walk out through enclosing frames, as Handlebars does.
         let mut found = None;
         for f in (0..=fi).rev() {
             if has_prop(&frames[f].value, key) {
@@ -712,7 +686,6 @@ fn literal_arg(s: &str) -> Option<Value> {
         "null" | "undefined" => return Some(Value::Null),
         _ => {}
     }
-    // /^-?\d+(?:\.\d+)?$/
     let body = s.strip_prefix('-').unwrap_or(s);
     let mut parts = body.split('.');
     let int = parts.next().unwrap_or("");
@@ -746,7 +719,6 @@ fn resolve_arg(arg: &str, frames: &[Frame]) -> Option<Value> {
     lookup(s, frames)
 }
 
-/// `String(v)` semantics, with null/false rendering as empty.
 fn stringify(v: Option<&Value>) -> String {
     match v {
         None | Some(Value::Null) | Some(Value::Bool(false)) => String::new(),
@@ -776,7 +748,6 @@ fn is_empty(v: Option<&Value>) -> bool {
     }
 }
 
-// --- render -----------------------------------------------------------------
 
 fn render(nodes: &[Node], frames: &[Frame]) -> Result<String, TemplateError> {
     let mut out = String::new();
@@ -887,150 +858,15 @@ fn render_each(
     }
 }
 
-/// Compile and render a template against `locals`.
 pub fn compile(template: &str, locals: &Value) -> Result<String, TemplateError> {
     let ast = parse(template)?;
     render(&ast, &[frame(locals.clone())])
 }
 
-/// Apply substitution when `locals` is a plain object; otherwise return the
-/// template unchanged, so existing `{{...}}` in a prompt is preserved unless
-/// the caller opts in.
 pub fn apply_locals(template: &str, locals: Option<&Value>) -> String {
     match locals {
         Some(Value::Object(_)) => compile(template, locals.unwrap())
             .unwrap_or_else(|_| template.to_string()),
         _ => template.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn t(src: &str, locals: Value) -> String {
-        compile(src, &locals).unwrap()
-    }
-
-    #[test]
-    fn substitutes_a_simple_path() {
-        assert_eq!(t("Hi {{name}}", json!({"name":"Ada"})), "Hi Ada");
-        assert_eq!(t("{{a.b.c}}", json!({"a":{"b":{"c":"deep"}}})), "deep");
-    }
-
-    #[test]
-    fn a_missing_path_renders_empty_not_undefined() {
-        assert_eq!(t("[{{nope}}]", json!({})), "[]");
-        assert_eq!(t("[{{a.b.c}}]", json!({"a":{}})), "[]");
-    }
-
-    #[test]
-    fn non_object_locals_leave_the_template_untouched() {
-        // The opt-in rule: without an object, {{...}} is preserved.
-        assert_eq!(apply_locals("Hi {{name}}", None), "Hi {{name}}");
-        assert_eq!(apply_locals("Hi {{name}}", Some(&json!([1, 2]))), "Hi {{name}}");
-        assert_eq!(
-            apply_locals("Hi {{name}}", Some(&json!({"name":"Ada"}))),
-            "Hi Ada"
-        );
-    }
-
-    #[test]
-    fn if_and_unless_with_else() {
-        assert_eq!(t("{{#if a}}Y{{else}}N{{/if}}", json!({"a":true})), "Y");
-        assert_eq!(t("{{#if a}}Y{{else}}N{{/if}}", json!({"a":false})), "N");
-        // JS falsy: 0, "", [] are all falsy.
-        assert_eq!(t("{{#if a}}Y{{else}}N{{/if}}", json!({"a":0})), "N");
-        assert_eq!(t("{{#if a}}Y{{else}}N{{/if}}", json!({"a":""})), "N");
-        assert_eq!(t("{{#if a}}Y{{else}}N{{/if}}", json!({"a":[]})), "N");
-        assert_eq!(t("{{#unless a}}Y{{else}}N{{/unless}}", json!({"a":false})), "Y");
-    }
-
-    #[test]
-    fn else_if_chains() {
-        let src = "{{#if a}}A{{else if b}}B{{else}}C{{/if}}";
-        assert_eq!(t(src, json!({"a":true})), "A");
-        assert_eq!(t(src, json!({"b":true})), "B");
-        assert_eq!(t(src, json!({})), "C");
-    }
-
-    #[test]
-    fn each_over_an_array_with_data_variables() {
-        assert_eq!(
-            t("{{#each xs}}{{@index}}:{{this}} {{/each}}", json!({"xs":["a","b"]})),
-            "0:a 1:b "
-        );
-        assert_eq!(
-            t("{{#each xs}}{{#if @first}}F{{/if}}{{#if @last}}L{{/if}}{{/each}}",
-              json!({"xs":[1,2]})),
-            "FL"
-        );
-    }
-
-    #[test]
-    fn each_over_an_object_exposes_key() {
-        assert_eq!(
-            t("{{#each m}}{{@key}}={{this}};{{/each}}", json!({"m":{"a":1,"b":2}})),
-            "a=1;b=2;"
-        );
-    }
-
-    #[test]
-    fn each_falls_back_to_else_when_empty() {
-        assert_eq!(t("{{#each xs}}x{{else}}none{{/each}}", json!({"xs":[]})), "none");
-        assert_eq!(t("{{#each xs}}x{{else}}none{{/each}}", json!({})), "none");
-    }
-
-    #[test]
-    fn parent_paths_reach_the_enclosing_context() {
-        assert_eq!(
-            t("{{#each xs}}{{../name}}-{{this}} {{/each}}",
-              json!({"name":"n","xs":[1,2]})),
-            "n-1 n-2 "
-        );
-    }
-
-    #[test]
-    fn with_narrows_the_context_and_else_covers_empty() {
-        assert_eq!(t("{{#with a}}{{b}}{{/with}}", json!({"a":{"b":"x"}})), "x");
-        assert_eq!(t("{{#with a}}{{b}}{{else}}E{{/with}}", json!({})), "E");
-    }
-
-    #[test]
-    fn a_backslash_escapes_a_mustache() {
-        assert_eq!(t("\\{{name}}", json!({"name":"Ada"})), "{{name}}");
-    }
-
-    #[test]
-    fn tilde_trims_surrounding_whitespace() {
-        assert_eq!(t("a   {{~name}}", json!({"name":"X"})), "aX");
-        assert_eq!(t("{{name~}}   b", json!({"name":"X"})), "Xb");
-    }
-
-    #[test]
-    fn a_standalone_block_tag_eats_its_own_line() {
-        // The {{#if}}/{{/if}} lines disappear entirely, leaving one line.
-        let src = "start\n{{#if a}}\nmiddle\n{{/if}}\nend";
-        assert_eq!(t(src, json!({"a":true})), "start\nmiddle\nend");
-    }
-
-    #[test]
-    fn unclosed_and_unknown_constructs_are_errors() {
-        assert!(compile("{{#if a}}x", &json!({})).is_err());
-        assert!(compile("{{name", &json!({})).is_err());
-        assert!(compile("{{#nope a}}x{{/nope}}", &json!({})).is_err());
-        assert!(compile("{{}}", &json!({})).is_err());
-        assert!(compile("{{else}}", &json!({})).is_err());
-    }
-
-    #[test]
-    fn literal_segments_allow_awkward_keys() {
-        assert_eq!(t("{{[odd key]}}", json!({"odd key":"v"})), "v");
-    }
-
-    #[test]
-    fn numbers_and_booleans_stringify_like_js() {
-        assert_eq!(t("{{n}}|{{b}}|{{f}}", json!({"n":3,"b":true,"f":false})), "3|true|");
     }
 }

@@ -1,12 +1,3 @@
-//! End-to-end check of the streamed inference path against a live
-//! OpenAI-compatible endpoint (default: the llama-server on :1234).
-//!
-//!   cargo run --example stream_smoke
-//!
-//! Proves three things the unit tests cannot: the request shape is accepted,
-//! deltas arrive incrementally rather than in one lump, and the assembled
-//! completion matches the text that was streamed.
-
 use agl::provider::{Channel, Endpoint, Generic, InferenceRequest, Message};
 
 #[tokio::main]
