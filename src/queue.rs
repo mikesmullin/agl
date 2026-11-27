@@ -90,6 +90,13 @@ pub struct Permit {
     q: Arc<ModelQueue>,
 }
 
+impl Permit {
+    /// The `provider:model` this slot is accounted under.
+    pub fn spec(&self) -> &str {
+        &self.q.spec
+    }
+}
+
 impl Drop for Permit {
     fn drop(&mut self) {
         {
@@ -170,6 +177,39 @@ fn queue_for(spec: &str) -> Arc<ModelQueue> {
         .clone()
 }
 
+/// Take the slot for `spec` **now**, or not at all — the atomic half of
+/// starting a turn.
+///
+/// A caller that decides "this turn may start" and *then* waits for a slot
+/// in the ordinary queue has left a window between the two decisions: two
+/// starters can both see a free slot and both begin. [`try_acquire`] closes
+/// it: the take is one critical section with the start decision that
+/// precedes it (the caller holds its own start lock across the call), so a
+/// taken slot is owned before anything else may observe the turn as
+/// started. Refuses when a slot is not free **or** anybody is already
+/// queued — a queued waiter has waited longer and keeps its FIFO place.
+pub fn try_acquire(spec: &str) -> Option<Permit> {
+    let q = queue_for(spec);
+    let taken = {
+        let mut st = q.state.lock().unwrap();
+        let limit = resolve_concurrency(spec).max(1);
+        if st.held < limit && st.waiters.is_empty() {
+            st.held += 1;
+            true
+        } else {
+            false
+        }
+    };
+    // `then_some` would build the permit either way — and dropping the
+    // refused one would release a slot somebody else holds. Build it only
+    // on the take.
+    if taken {
+        Some(Permit { q })
+    } else {
+        None
+    }
+}
+
 /// Wait for a turn slot on `spec` (`provider:model`). The returned future
 /// resolves to a [`Permit`] held until dropped.
 pub fn acquire(spec: &str) -> Acquire {
@@ -207,6 +247,35 @@ mod tests {
     // Each test uses its own spec: the registry is process-global and the
     // tests run in parallel. The limit defaults to 1 with no config, which
     // is exactly what these tests want.
+
+    #[test]
+    fn try_acquire_takes_now_or_not_at_all() {
+        // Free: taken on the spot, held counted.
+        let p = try_acquire("qtest-try:m").expect("free slot");
+        assert_eq!(p.spec(), "qtest-try:m");
+        assert_eq!(stats("qtest-try:m").held, 1);
+        // Held: refused — no queue, no partial take, and above all no
+        // release of the slot somebody else is holding.
+        assert!(try_acquire("qtest-try:m").is_none());
+        assert_eq!(stats("qtest-try:m").held, 1, "the refusal must not steal the slot");
+        // Dropped: the slot is free again.
+        drop(p);
+        assert!(try_acquire("qtest-try:m").is_some());
+    }
+
+    #[test]
+    fn try_acquire_never_barges_past_a_waiter() {
+        rt().block_on(async {
+            let _p = try_acquire("qtest-barge:m").expect("free slot");
+            let mut t = tokio::spawn(async { acquire("qtest-barge:m").await });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(stats("qtest-barge:m").waiting, 1);
+            // The slot is taken, and even were it free, the waiter is first.
+            assert!(try_acquire("qtest-barge:m").is_none());
+            drop(_p);
+            t.abort();
+        });
+    }
 
     #[test]
     fn a_second_turn_waits_until_the_first_releases() {

@@ -242,6 +242,20 @@ pub fn resolve_default_model() -> String {
     config::read_user_default_model().unwrap_or_else(|| FALLBACK_DEFAULT_MODEL.to_string())
 }
 
+/// The `provider:model` key a model string is queued and accounted under —
+/// the same binding [`Agent::factory`] performs, so a slot taken for a
+/// model string is the slot the built agent will hold ("default" resolves
+/// first, exactly as it does there).
+pub fn queue_spec(model: &str) -> String {
+    let spec = if model == "default" {
+        resolve_default_model()
+    } else {
+        model.to_string()
+    };
+    let (raw_provider, m) = split_provider_model(&spec);
+    format!("{}:{}", normalize_gateway_provider(&raw_provider), m)
+}
+
 fn pick_window(group: &BTreeMap<String, Yaml>, key: &str) -> Option<u64> {
     let n = group.get(key)?.as_i64()?;
     if n > 0 {
@@ -476,6 +490,12 @@ pub struct Factory {
     /// one-shot transcript each time. angela (a multi-turn chat harness) needs
     /// this; JS default is `false`.
     pub retain_history: Option<bool>,
+    /// A turn slot the caller **already holds** for this agent's bound
+    /// spec, taken atomically where the turn was decided (angela's message
+    /// queue). The run takes no second one: on a single-concurrency model
+    /// that would deadlock against its own turn. A permit for a different
+    /// spec is ignored — the run acquires honestly for the spec it bound.
+    pub slot: Option<std::sync::Arc<crate::queue::Permit>>,
     /// Execute a turn's tool calls concurrently. angela passes `true`.
     /// JS default is `false`.
     pub parallel_tools: Option<bool>,
@@ -580,6 +600,9 @@ pub struct Agent {
     context_window: std::sync::Mutex<Vec<ContextRow>>,
     /// Token counts from the most recent provider response.
     pub last_usage: std::sync::Mutex<Option<crate::provider::TokenUsage>>,
+    /// The caller-held turn slot (see [`Factory::slot`]); consumed by
+    /// [`Agent::run_inner`] instead of queueing for one.
+    slot: Option<std::sync::Arc<crate::queue::Permit>>,
 
     // System One
     pub decision_provider: Option<String>,
@@ -698,7 +721,7 @@ impl Agent {
             if opts.ca_file.is_some() {
                 ep.ca_file = opts.ca_file.clone();
             }
-            let bs = format!("{provider}:{model}");
+            let bs = queue_spec(&spec);
             (ep, q, model, bs)
         };
 
@@ -713,6 +736,7 @@ impl Agent {
             model,
             context_window_size: resolve_context_window(&bound_spec),
             bound_spec,
+            slot: opts.slot,
             client,
             endpoint_quirks: quirks,
             system_prompt,
@@ -1083,18 +1107,27 @@ impl Agent {
         let retain = self.retain_history;
 
         // The turn queue: one slot per `provider:model` (c=N from the user
-        // config), held until the turn ends. When the slot is not free the
-        // wait is announced first, so the transcript shows why nothing is
-        // streaming yet. The permit releases on every exit path — answer,
-        // error, or cancellation — because it is dropped, not returned.
-        let st = crate::queue::stats(&self.bound_spec);
-        if st.held >= st.limit || st.waiting > 0 {
-            on_event(TurnEvent::Queued {
-                spec: &self.bound_spec,
-                position: st.waiting + 1,
-            });
-        }
-        let _permit = crate::queue::acquire(&self.bound_spec).await;
+        // config), held until the turn ends. A caller that took the slot
+        // itself (atomically, where it decided the turn may start) holds it
+        // here instead of queueing — taking a second one would deadlock a
+        // single-concurrency model against its own turn. Only a run that
+        // has no held slot announces a wait, so the transcript shows why
+        // nothing is streaming yet. The permit releases on every exit path
+        // — answer, error, or cancellation — because it is dropped, not
+        // returned.
+        let _permit: std::sync::Arc<crate::queue::Permit> = match &self.slot {
+            Some(held) if held.spec() == self.bound_spec => held.clone(),
+            _ => {
+                let st = crate::queue::stats(&self.bound_spec);
+                if st.held >= st.limit || st.waiting > 0 {
+                    on_event(TurnEvent::Queued {
+                        spec: &self.bound_spec,
+                        position: st.waiting + 1,
+                    });
+                }
+                std::sync::Arc::new(crate::queue::acquire(&self.bound_spec).await)
+            }
+        };
 
         // Retained: the prompt joins the persistent window. One-shot: an
         // ephemeral transcript, so a stateless call cannot pollute context.
